@@ -1,0 +1,83 @@
+#!/bin/bash
+###############################################################################
+# dump_mysql_yearly.sh - Dump anual de MySQL RDS → bucket long-term (8 años)
+#
+# Crontab: 0 2 10 1 * /opt/scripts/yearly/dump_mysql_yearly.sh
+#
+# Uso manual:
+#   ./dump_mysql_yearly.sh
+#
+# Configurar variables en la seccion CONFIGURACION antes de usar.
+###############################################################################
+set -euo pipefail
+
+# ======================== CONFIGURACION ========================
+DB_HOST="CHANGE_ME.rds.amazonaws.com"
+DB_PORT="3306"
+DB_USER="admin"
+DB_PASS="CHANGE_ME"
+DB_NAME="mydb"  # Usar "ALL" para todas las bases
+S3_BUCKET="CHANGE_ME-dumps-long-term"
+# ===============================================================
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_DIR="/backups/mysql/yearly"
+LOG_FILE="/backups/mysql/logs/dump_mysql_yearly_${TIMESTAMP}.log"
+
+mkdir -p "${BACKUP_DIR}" "/backups/mysql/logs"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "${LOG_FILE}"
+}
+
+cleanup() {
+  log "Limpiando archivos temporales..."
+  if [[ -n "${DUMP_FILE:-}" && -f "${DUMP_FILE}" ]]; then
+    rm -f "${DUMP_FILE}"
+    log "Archivo temporal ${DUMP_FILE} eliminado"
+  fi
+}
+trap cleanup EXIT
+
+DUMP_FILE="${BACKUP_DIR}/${DB_NAME}_yearly_${TIMESTAMP}.sql.gz"
+S3_KEY="mysql/${DB_NAME}/yearly/${DB_NAME}_yearly_${TIMESTAMP}.sql.gz"
+
+log "=========================================="
+log "Dump ANUAL MySQL RDS → bucket long-term (8 años)"
+log "Host: ${DB_HOST}:${DB_PORT} | Database: ${DB_NAME}"
+log "=========================================="
+
+log "Verificando conectividad..."
+mysql -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -p"${DB_PASS}" \
+  -e "SELECT 1;" > /dev/null 2>&1 || {
+  log "ERROR: No se pudo conectar a MySQL RDS"; exit 1
+}
+
+log "Ejecutando mysqldump..."
+if [[ "${DB_NAME}" == "ALL" ]]; then
+  mysqldump -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -p"${DB_PASS}" \
+    --all-databases --single-transaction --routines --triggers --events \
+    --set-gtid-purged=OFF --column-statistics=0 --no-tablespaces \
+    2>>"${LOG_FILE}" | gzip -9 > "${DUMP_FILE}" || {
+    log "ERROR: Fallo el mysqldump"; exit 1
+  }
+else
+  mysqldump -h "${DB_HOST}" -P "${DB_PORT}" -u "${DB_USER}" -p"${DB_PASS}" \
+    --databases "${DB_NAME}" --single-transaction --routines --triggers --events \
+    --set-gtid-purged=OFF --column-statistics=0 --no-tablespaces \
+    2>>"${LOG_FILE}" | gzip -9 > "${DUMP_FILE}" || {
+    log "ERROR: Fallo el mysqldump"; exit 1
+  }
+fi
+
+DUMP_SIZE=$(du -sh "${DUMP_FILE}" | cut -f1)
+log "Dump generado: ${DUMP_FILE} (${DUMP_SIZE})"
+
+log "Subiendo a s3://${S3_BUCKET}/${S3_KEY}..."
+aws s3 cp "${DUMP_FILE}" "s3://${S3_BUCKET}/${S3_KEY}" --storage-class STANDARD --only-show-errors || {
+  log "ERROR: Fallo la subida a S3"; exit 1
+}
+
+S3_SIZE=$(aws s3 ls "s3://${S3_BUCKET}/${S3_KEY}" | awk '{print $3}')
+log "Subido exitosamente (${S3_SIZE} bytes)"
+log "Dump anual MySQL completado: s3://${S3_BUCKET}/${S3_KEY}"

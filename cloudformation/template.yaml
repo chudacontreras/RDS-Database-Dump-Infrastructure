@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Infraestructura para dumps de RDS (Oracle, PostgreSQL, MySQL).
+  Incluye 2 buckets S3 con lifecycle, EC2 bastion, EFS y politicas de minimo privilegio.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde se desplegara la infraestructura
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet para la instancia EC2 y EFS
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Key pair para acceso SSH a la instancia bastion
+  AllowedSshCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR permitido para SSH
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large, t3.xlarge]
+    Description: Tipo de instancia EC2
+
+Resources:
+  # ============================================================
+  # S3 Buckets
+  # ============================================================
+  S3BucketLongTerm:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-dumps-long-term-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAndExpire8Years
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+            ExpirationInDays: 2920
+
+  S3BucketShortTerm:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-dumps-short-term-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAndExpire1Year
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+            ExpirationInDays: 365
+
+  # ============================================================
+  # EFS File System
+  # ============================================================
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dumps-efs'
+
+  EFSMountTarget:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EFSFileSystem
+      SubnetId: !Ref SubnetId
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group para instancia bastion de dumps
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSshCidr
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS para AWS APIs y repos
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP para repos de paquetes
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 0.0.0.0/0
+          Description: NFS para EFS
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: 0.0.0.0/0
+          Description: Oracle RDS
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL RDS
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+          Description: MySQL RDS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-sg'
+
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group para EFS mount targets
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-efs-sg'
+
+  # ============================================================
+  # IAM Role - Minimo Privilegio
+  # ============================================================
+  BastionInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-bastion-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3DumpUploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowPutObjectToDumpBuckets
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource:
+                  - !Sub '${S3BucketLongTerm.Arn}/*'
+                  - !Sub '${S3BucketShortTerm.Arn}/*'
+              - Sid: AllowListDumpBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt S3BucketLongTerm.Arn
+                  - !GetAtt S3BucketShortTerm.Arn
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/dumps/*'
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BastionInstanceRole
+
+  # ============================================================
+  # EC2 Bastion Instance
+  # ============================================================
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: EFSMountTarget
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bastion-dumps'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          echo "=== Actualizando sistema operativo ==="
+          dnf update -y
+
+          echo "=== Instalando herramientas base ==="
+          dnf install -y \
+            amazon-efs-utils \
+            nfs-utils \
+            aws-cli \
+            gzip \
+            tar \
+            jq \
+            unzip \
+            cronie
+
+          echo "=== Instalando cliente PostgreSQL ==="
+          dnf install -y postgresql15
+
+          echo "=== Instalando cliente MySQL ==="
+          dnf install -y mariadb105
+
+          echo "=== Instalando Oracle Instant Client ==="
+          dnf install -y libaio
+          ORACLE_VERSION="21.15.0.0.0-1"
+          ORACLE_BASE_URL="https://yum.oracle.com/repo/OracleLinux/OL9/oracle/instantclient/x86_64/getPackage"
+          rpm -ivh ${!ORACLE_BASE_URL}/oracle-instantclient-basic-${!ORACLE_VERSION}.el9.x86_64.rpm || true
+          rpm -ivh ${!ORACLE_BASE_URL}/oracle-instantclient-sqlplus-${!ORACLE_VERSION}.el9.x86_64.rpm || true
+          rpm -ivh ${!ORACLE_BASE_URL}/oracle-instantclient-tools-${!ORACLE_VERSION}.el9.x86_64.rpm || true
+
+          echo 'export LD_LIBRARY_PATH=/usr/lib/oracle/21/client64/lib:$LD_LIBRARY_PATH' >> /etc/profile.d/oracle.sh
+          echo 'export PATH=/usr/lib/oracle/21/client64/bin:$PATH' >> /etc/profile.d/oracle.sh
+          source /etc/profile.d/oracle.sh
+
+          echo "=== Instalando y habilitando SSM Agent ==="
+          dnf install -y amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+
+          echo "=== Montando EFS en /backups ==="
+          mkdir -p /backups
+          echo "${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com:/ /backups efs _netdev,tls 0 0" >> /etc/fstab
+          mount -a || mount -t efs -o tls ${EFSFileSystem}:/ /backups
+
+          echo "=== Creando directorios de trabajo ==="
+          mkdir -p /backups/{oracle,postgresql,mysql}/{monthly,yearly,logs}
+          mkdir -p /opt/scripts/{monthly,yearly}
+
+          echo "=== Habilitando servicio cron ==="
+          systemctl enable crond
+          systemctl start crond
+
+          echo "=== Configurando crontabs ==="
+          cat > /etc/cron.d/dump-monthly <<'CRON'
+          # Dump mensual - dia 5 de cada mes a las 02:00 -> bucket short-term (1 año)
+          0 2 5 * * root /opt/scripts/monthly/dump_oracle_monthly.sh >> /backups/oracle/logs/cron_monthly.log 2>&1
+          30 2 5 * * root /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_monthly.log 2>&1
+          0 3 5 * * root /opt/scripts/monthly/dump_mysql_monthly.sh >> /backups/mysql/logs/cron_monthly.log 2>&1
+          CRON
+
+          cat > /etc/cron.d/dump-yearly <<'CRON'
+          # Dump anual - dia 10 de enero a las 02:00 -> bucket long-term (8 años)
+          0 2 10 1 * root /opt/scripts/yearly/dump_oracle_yearly.sh >> /backups/oracle/logs/cron_yearly.log 2>&1
+          30 2 10 1 * root /opt/scripts/yearly/dump_postgresql_yearly.sh >> /backups/postgresql/logs/cron_yearly.log 2>&1
+          0 3 10 1 * root /opt/scripts/yearly/dump_mysql_yearly.sh >> /backups/mysql/logs/cron_yearly.log 2>&1
+          CRON
+
+          chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
+
+          echo "=== Configuracion completada ==="
+
+  # ============================================================
+  # Outputs
+  # ============================================================
+Outputs:
+  BastionInstanceId:
+    Description: ID de la instancia bastion
+    Value: !Ref BastionInstance
+  BastionPrivateIp:
+    Description: IP privada de la instancia bastion
+    Value: !GetAtt BastionInstance.PrivateIpAddress
+  S3BucketLongTermName:
+    Description: Nombre del bucket S3 de retencion 8 anios
+    Value: !Ref S3BucketLongTerm
+  S3BucketShortTermName:
+    Description: Nombre del bucket S3 de retencion 1 anio
+    Value: !Ref S3BucketShortTerm
+  EFSFileSystemId:
+    Description: ID del sistema de archivos EFS
+    Value: !Ref EFSFileSystem
+  BastionSecurityGroupId:
+    Description: ID del security group del bastion
+    Value: !Ref BastionSecurityGroup
