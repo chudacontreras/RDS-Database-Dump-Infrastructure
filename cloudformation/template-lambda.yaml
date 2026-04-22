@@ -1,0 +1,495 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Infraestructura SERVERLESS para dumps de RDS (Oracle, PostgreSQL, MySQL).
+  Usa Lambda + EventBridge en lugar de EC2 + crontab.
+  Oracle usa container image Lambda; PostgreSQL y MySQL usan Lambda Layers.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde están las instancias RDS
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets privadas con acceso a RDS (mínimo 2 para Lambda VPC)
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group que permite acceso a las instancias RDS
+
+  # PostgreSQL
+  PgDbHost:
+    Type: String
+    Default: ''
+    Description: Endpoint de PostgreSQL RDS (dejar vacío si no aplica)
+  PgDbPort:
+    Type: String
+    Default: '5432'
+  PgDbUser:
+    Type: String
+    Default: 'admin'
+  PgDbName:
+    Type: String
+    Default: 'mydb'
+  PgSecretArn:
+    Type: String
+    Default: ''
+    Description: ARN del secreto en Secrets Manager con la password de PostgreSQL
+  PgSchemas:
+    Type: String
+    Default: ''
+    Description: Schemas a exportar (vacío = full dump)
+
+  # MySQL
+  MyDbHost:
+    Type: String
+    Default: ''
+  MyDbPort:
+    Type: String
+    Default: '3306'
+  MyDbUser:
+    Type: String
+    Default: 'admin'
+  MyDbName:
+    Type: String
+    Default: 'mydb'
+  MySecretArn:
+    Type: String
+    Default: ''
+  
+  # Oracle
+  OraDbHost:
+    Type: String
+    Default: ''
+  OraDbPort:
+    Type: String
+    Default: '1521'
+  OraDbUser:
+    Type: String
+    Default: 'admin'
+  OraDbService:
+    Type: String
+    Default: 'ORCL'
+  OraSecretArn:
+    Type: String
+    Default: ''
+  OraSchemas:
+    Type: String
+    Default: ''
+  OracleImageUri:
+    Type: String
+    Default: ''
+    Description: URI de la imagen ECR para la Lambda de Oracle (account.dkr.ecr.region.amazonaws.com/repo:tag)
+
+Conditions:
+  HasPostgreSQL: !Not [!Equals [!Ref PgDbHost, '']]
+  HasMySQL: !Not [!Equals [!Ref MyDbHost, '']]
+  HasOracle: !Not [!Equals [!Ref OraDbHost, '']]
+
+Resources:
+  # ============================================================
+  # S3 Buckets (idénticos a la solución EC2)
+  # ============================================================
+  S3BucketLongTerm:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-dumps-long-term-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAndExpire8Years
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+            ExpirationInDays: 2920
+
+  S3BucketShortTerm:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-dumps-short-term-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAndExpire1Year
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+            ExpirationInDays: 365
+
+  # ============================================================
+  # Security Group para Lambdas en VPC
+  # ============================================================
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group para Lambda functions de dumps
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS para AWS APIs (S3, Secrets Manager)
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: 0.0.0.0/0
+          Description: Oracle RDS
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+          Description: PostgreSQL RDS
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+          Description: MySQL RDS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-lambda-sg'
+
+  # ============================================================
+  # IAM Role para Lambda - Mínimo Privilegio
+  # ============================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-dump-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: S3DumpUploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowPutObjectToDumpBuckets
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource:
+                  - !Sub '${S3BucketLongTerm.Arn}/*'
+                  - !Sub '${S3BucketShortTerm.Arn}/*'
+              - Sid: AllowListDumpBuckets
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt S3BucketLongTerm.Arn
+                  - !GetAtt S3BucketShortTerm.Arn
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowReadSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+
+  # ============================================================
+  # Lambda - PostgreSQL Dump
+  # ============================================================
+  PostgreSQLDumpFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasPostgreSQL
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dump-postgresql'
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        ZipFile: |
+          # Placeholder - desplegar código real desde lambda/postgresql/handler.py
+          # usando SAM CLI o empaquetando manualmente
+          def handler(event, context):
+              return {"statusCode": 501, "body": "Deploy real code"}
+      Timeout: 900
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 10240
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref PgDbHost
+          DB_PORT: !Ref PgDbPort
+          DB_USER: !Ref PgDbUser
+          DB_NAME: !Ref PgDbName
+          DB_SECRET_ARN: !Ref PgSecretArn
+          SCHEMAS: !Ref PgSchemas
+          S3_BUCKET_SHORT_TERM: !Ref S3BucketShortTerm
+          S3_BUCKET_LONG_TERM: !Ref S3BucketLongTerm
+      # Layers:
+      #   - !Ref PostgreSQLLayer  # Layer con pg_dump compilado para Amazon Linux 2023
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dump-postgresql'
+
+  # ============================================================
+  # Lambda - MySQL Dump
+  # ============================================================
+  MySQLDumpFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasMySQL
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dump-mysql'
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {"statusCode": 501, "body": "Deploy real code"}
+      Timeout: 900
+      MemorySize: 1024
+      EphemeralStorage:
+        Size: 10240
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref MyDbHost
+          DB_PORT: !Ref MyDbPort
+          DB_USER: !Ref MyDbUser
+          DB_NAME: !Ref MyDbName
+          DB_SECRET_ARN: !Ref MySecretArn
+          S3_BUCKET_SHORT_TERM: !Ref S3BucketShortTerm
+          S3_BUCKET_LONG_TERM: !Ref S3BucketLongTerm
+      # Layers:
+      #   - !Ref MySQLLayer  # Layer con mysqldump compilado para Amazon Linux 2023
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dump-mysql'
+
+  # ============================================================
+  # Lambda - Oracle Dump (Container Image)
+  # ============================================================
+  OracleDumpFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasOracle
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-dump-oracle'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref OracleImageUri
+      Timeout: 900
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 10240
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DB_HOST: !Ref OraDbHost
+          DB_PORT: !Ref OraDbPort
+          DB_USER: !Ref OraDbUser
+          DB_SERVICE: !Ref OraDbService
+          DB_SECRET_ARN: !Ref OraSecretArn
+          SCHEMAS: !Ref OraSchemas
+          S3_BUCKET_SHORT_TERM: !Ref S3BucketShortTerm
+          S3_BUCKET_LONG_TERM: !Ref S3BucketLongTerm
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dump-oracle'
+
+  # ============================================================
+  # EventBridge Rules (reemplazan los crontabs)
+  # ============================================================
+
+  # --- MENSUAL: día 5 de cada mes ---
+  MonthlyPgRule:
+    Type: AWS::Events::Rule
+    Condition: HasPostgreSQL
+    Properties:
+      Name: !Sub '${AWS::StackName}-monthly-postgresql'
+      Description: Dump mensual PostgreSQL - día 5 a las 02:00 UTC
+      ScheduleExpression: 'cron(0 2 5 * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: PostgreSQLMonthlyDump
+          Arn: !GetAtt PostgreSQLDumpFunction.Arn
+          Input: '{"dump_type": "monthly"}'
+
+  MonthlyMyRule:
+    Type: AWS::Events::Rule
+    Condition: HasMySQL
+    Properties:
+      Name: !Sub '${AWS::StackName}-monthly-mysql'
+      Description: Dump mensual MySQL - día 5 a las 02:30 UTC
+      ScheduleExpression: 'cron(30 2 5 * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: MySQLMonthlyDump
+          Arn: !GetAtt MySQLDumpFunction.Arn
+          Input: '{"dump_type": "monthly"}'
+
+  MonthlyOraRule:
+    Type: AWS::Events::Rule
+    Condition: HasOracle
+    Properties:
+      Name: !Sub '${AWS::StackName}-monthly-oracle'
+      Description: Dump mensual Oracle - día 5 a las 03:00 UTC
+      ScheduleExpression: 'cron(0 3 5 * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: OracleMonthlyDump
+          Arn: !GetAtt OracleDumpFunction.Arn
+          Input: '{"dump_type": "monthly"}'
+
+  # --- ANUAL: día 10 de enero ---
+  YearlyPgRule:
+    Type: AWS::Events::Rule
+    Condition: HasPostgreSQL
+    Properties:
+      Name: !Sub '${AWS::StackName}-yearly-postgresql'
+      Description: Dump anual PostgreSQL - 10 enero a las 02:00 UTC
+      ScheduleExpression: 'cron(0 2 10 1 ? *)'
+      State: ENABLED
+      Targets:
+        - Id: PostgreSQLYearlyDump
+          Arn: !GetAtt PostgreSQLDumpFunction.Arn
+          Input: '{"dump_type": "yearly"}'
+
+  YearlyMyRule:
+    Type: AWS::Events::Rule
+    Condition: HasMySQL
+    Properties:
+      Name: !Sub '${AWS::StackName}-yearly-mysql'
+      Description: Dump anual MySQL - 10 enero a las 02:30 UTC
+      ScheduleExpression: 'cron(30 2 10 1 ? *)'
+      State: ENABLED
+      Targets:
+        - Id: MySQLYearlyDump
+          Arn: !GetAtt MySQLDumpFunction.Arn
+          Input: '{"dump_type": "yearly"}'
+
+  YearlyOraRule:
+    Type: AWS::Events::Rule
+    Condition: HasOracle
+    Properties:
+      Name: !Sub '${AWS::StackName}-yearly-oracle'
+      Description: Dump anual Oracle - 10 enero a las 03:00 UTC
+      ScheduleExpression: 'cron(0 3 10 1 ? *)'
+      State: ENABLED
+      Targets:
+        - Id: OracleYearlyDump
+          Arn: !GetAtt OracleDumpFunction.Arn
+          Input: '{"dump_type": "yearly"}'
+
+  # ============================================================
+  # Lambda Permissions para EventBridge
+  # ============================================================
+  PgMonthlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasPostgreSQL
+    Properties:
+      FunctionName: !Ref PostgreSQLDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyPgRule.Arn
+
+  PgYearlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasPostgreSQL
+    Properties:
+      FunctionName: !Ref PostgreSQLDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YearlyPgRule.Arn
+
+  MyMonthlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasMySQL
+    Properties:
+      FunctionName: !Ref MySQLDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyMyRule.Arn
+
+  MyYearlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasMySQL
+    Properties:
+      FunctionName: !Ref MySQLDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YearlyMyRule.Arn
+
+  OraMonthlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasOracle
+    Properties:
+      FunctionName: !Ref OracleDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyOraRule.Arn
+
+  OraYearlyPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasOracle
+    Properties:
+      FunctionName: !Ref OracleDumpFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YearlyOraRule.Arn
+
+Outputs:
+  S3BucketLongTermName:
+    Description: Bucket S3 retención 8 años
+    Value: !Ref S3BucketLongTerm
+  S3BucketShortTermName:
+    Description: Bucket S3 retención 1 año
+    Value: !Ref S3BucketShortTerm
+  LambdaSecurityGroupId:
+    Description: Security group de las Lambdas
+    Value: !Ref LambdaSecurityGroup
+  PostgreSQLFunctionArn:
+    Condition: HasPostgreSQL
+    Description: ARN de la Lambda PostgreSQL
+    Value: !GetAtt PostgreSQLDumpFunction.Arn
+  MySQLFunctionArn:
+    Condition: HasMySQL
+    Description: ARN de la Lambda MySQL
+    Value: !GetAtt MySQLDumpFunction.Arn
+  OracleFunctionArn:
+    Condition: HasOracle
+    Description: ARN de la Lambda Oracle
+    Value: !GetAtt OracleDumpFunction.Arn

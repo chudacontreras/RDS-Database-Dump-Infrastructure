@@ -1,0 +1,31 @@
+aws_region   = "us-east-1"
+vpc_id       = "vpc-0123456789abcdef0"
+subnet_ids   = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1"]
+project_name = "rds-dumps"
+
+# PostgreSQL
+pg_enabled   = true
+pg_db_host   = "mydb.cluster-xxxx.us-east-1.rds.amazonaws.com"
+pg_db_port   = "5432"
+pg_db_user   = "admin"
+pg_db_name   = "mydb"
+pg_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:pg-password-AbCdEf"
+pg_schemas   = ""
+
+# MySQL
+my_enabled   = true
+my_db_host   = "mydb.cluster-xxxx.us-east-1.rds.amazonaws.com"
+my_db_port   = "3306"
+my_db_user   = "admin"
+my_db_name   = "mydb"
+my_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:my-password-AbCdEf"
+
+# Oracle (requiere imagen ECR previa - ver lambda/oracle/Dockerfile)
+ora_enabled    = true
+ora_db_host    = "mydb.xxxx.us-east-1.rds.amazonaws.com"
+ora_db_port    = "1521"
+ora_db_user    = "admin"
+ora_db_service = "ORCL"
+ora_secret_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:ora-password-AbCdEf"
+ora_schemas    = ""
+ora_image_uri  = "123456789012.dkr.ecr.us-east-1.amazonaws.com/rds-dumps-oracle:latest"
