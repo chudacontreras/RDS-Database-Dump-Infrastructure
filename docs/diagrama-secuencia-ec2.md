@@ -60,7 +60,7 @@ sequenceDiagram
 
 | Paso | Componente   | Acción                                                                     |
 | ---- | ------------ | -------------------------------------------------------------------------- |
-| 1    | Encender EC2 | Encender instancia usando Orbis el día  del Backup                         |
+| 1    | Encender EC2 | Encender instancia el día  del Backup                                      |
 | 2    | Crontab      | Dispara el script según el schedule configurado (mensual o anual)          |
 | 3    | Script       | Crea/verifica directorios de trabajo en EFS (`/backups/{engine}/{period}`) |
 | 4    | Script → RDS | Prueba de conectividad (`SELECT 1` o `SELECT 'OK' FROM DUAL`)              |
@@ -71,4 +71,4 @@ sequenceDiagram
 | 9    | Script → S3  | Verifica el tamaño del archivo subido con `aws s3 ls`                      |
 | 10   | Script → EFS | Elimina el archivo temporal (trap cleanup en EXIT)                         |
 | 11   | S3           | Lifecycle policy mueve a Glacier a los 30 días y expira según retención    |
-| 12   | Apagar EC2   | Apagar EC2 usando Orbis                                                    |
+| 12   | Apagar EC2   | Apagar EC2                                                                 |
