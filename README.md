@@ -114,48 +114,148 @@ terraform init && terraform plan && terraform apply
 
 ### Post-despliegue EC2
 
-Una vez desplegada la infraestructura, conectarse a la instancia via SSM o SSH y ejecutar los siguientes pasos manualmente si el user data no los completó correctamente:
+Una vez desplegada la infraestructura, conectarse a la instancia via SSM o SSH y ejecutar los siguientes pasos:
 
-#### 1. Montar EFS en /backups
+#### Paso 1: Crear directorio y montar EFS en /backups
 
 ```bash
 # Crear punto de montaje
 sudo mkdir -p /backups
 
-# Agregar entrada en fstab (reemplazar EFS_ID y REGION con valores reales)
-echo "fs-XXXXXXXX.efs.us-east-1.amazonaws.com:/ /backups efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
+# Agregar entrada en fstab (reemplazar EFS_ID y REGION con valores reales del output del stack)
+sudo bash -c 'echo "fs-XXXXXXXX.efs.us-east-1.amazonaws.com:/ /backups efs _netdev,tls 0 0" >> /etc/fstab'
 
 # Montar
 sudo mount -a
-# Si falla, intentar montaje directo:
-# sudo mount -t efs -o tls fs-XXXXXXXX:/ /backups
 
-# Verificar
+# Si mount -a falla, intentar montaje directo:
+sudo mount -t efs -o tls fs-XXXXXXXX:/ /backups
+
+# Verificar que esta montado
 df -h /backups
 ```
 
-#### 2. Crear directorios de trabajo
+#### Paso 2: Crear directorios de trabajo
 
 ```bash
+# Directorios para backups en EFS
 sudo mkdir -p /backups/oracle/monthly /backups/oracle/yearly /backups/oracle/logs
 sudo mkdir -p /backups/postgresql/monthly /backups/postgresql/yearly /backups/postgresql/logs
 sudo mkdir -p /backups/mysql/monthly /backups/mysql/yearly /backups/mysql/logs
+
+# Directorios para los scripts
 sudo mkdir -p /opt/scripts/monthly /opt/scripts/yearly
 ```
 
-#### 3. Copiar scripts a la instancia
+#### Paso 3: Copiar scripts a la instancia
 
 ```bash
-# Desde tu maquina local (via SCP o SSM)
-scp scripts/monthly/*.sh ec2-user@<IP>:/opt/scripts/monthly/
-scp scripts/yearly/*.sh ec2-user@<IP>:/opt/scripts/yearly/
+# Opcion A: Desde tu maquina local via SCP
+scp scripts/monthly/*.sh ec2-user@<IP>:/tmp/
+scp scripts/yearly/*.sh ec2-user@<IP>:/tmp/
+# Luego en la EC2:
+sudo mv /tmp/dump_*_monthly.sh /opt/scripts/monthly/
+sudo mv /tmp/dump_*_yearly.sh /opt/scripts/yearly/
+
+# Opcion B: Desde la EC2 via git clone o S3
+# aws s3 cp s3://mi-bucket/scripts/ /opt/scripts/ --recursive
 
 # Dar permisos de ejecucion
 sudo chmod +x /opt/scripts/monthly/*.sh
 sudo chmod +x /opt/scripts/yearly/*.sh
 ```
 
-#### 4. Habilitar servicio cron
+#### Paso 4: Editar la política de Secrets Manager del IAM Role
+
+La política desplegada por defecto permite acceso a **todos** los secrets de la cuenta (`secret:*`).
+Se debe restringir al ARN específico del secret que usa cada cuenta/ambiente.
+
+**ARN genérico de un secret:**
+```
+arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:<NOMBRE>/<AMBIENTE>/<SECRETO>-<SUFIJO_6_CHARS>
+```
+
+**Ejemplo real:**
+```
+arn:aws:secretsmanager:us-east-1:123456789012:secret:postgresAurora/qa/rds-credentials-oVWs0C
+```
+
+> **Nota:** Secrets Manager agrega un sufijo aleatorio de 6 caracteres al ARN del secret. Puedes obtener el ARN completo con:
+> ```bash
+> aws secretsmanager describe-secret --secret-id nombre/ambiente/secreto --query 'ARN' --output text
+> ```
+
+**Editar la política del role:**
+
+```bash
+aws iam put-role-policy \
+  --role-name <NOMBRE_DEL_ROLE> \
+  --policy-name SecretsManagerReadPolicy \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "AllowReadSecrets",
+        "Effect": "Allow",
+        "Action": [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ],
+        "Resource": [
+          "arn:aws:secretsmanager:us-east-1:<ACCOUNT_ID>:secret:nombre/ambiente/secreto-XXXXXX"
+        ]
+      }
+    ]
+  }'
+```
+
+Reemplazar:
+- `<NOMBRE_DEL_ROLE>` — nombre del IAM Role del bastion (ej: `bbpa-rds-backups-bastion-role`)
+- `<ACCOUNT_ID>` — ID de la cuenta AWS (ej: `123456789012`)
+- `nombre/ambiente/secreto-XXXXXX` — ARN completo del secret incluyendo el sufijo
+
+Si se necesitan múltiples secrets (Oracle, PostgreSQL, MySQL), agregar cada ARN al array de `Resource`:
+```json
+"Resource": [
+  "arn:aws:secretsmanager:us-east-1:123456789012:secret:postgresAurora/prod/rds-creds-AbCdEf",
+  "arn:aws:secretsmanager:us-east-1:123456789012:secret:oracle/prod/rds-creds-GhIjKl",
+  "arn:aws:secretsmanager:us-east-1:123456789012:secret:mysql/prod/rds-creds-MnOpQr"
+]
+```
+
+#### Paso 5: Editar los scripts de backup
+
+Cada script tiene una sección de configuración al inicio. Editar los siguientes valores:
+
+```bash
+sudo vi /opt/scripts/monthly/dump_postgresql_monthly.sh
+```
+
+**Variables a modificar (OPCION 1 — Secrets Manager):**
+
+| Variable | Descripción | Ejemplo |
+|----------|-------------|---------|
+| `SECRET_NAME` | Nombre del secret en Secrets Manager | `postgresAurora/qa/rds-credentials` |
+| `AWS_REGION` | Región donde está el secret | `us-east-1` |
+| `S3_BUCKET` | Nombre del bucket S3 destino | `mi-proyecto-dumps-short-term-123456789012` |
+| `SCHEMAS` | Schemas a exportar (vacío = todos) | `public,app` |
+
+**Variables a modificar (OPCION 2 — Credenciales hardcodeadas):**
+
+Comentar el bloque OPCION 1 y descomentar OPCION 2, luego editar:
+
+| Variable | Descripción | Ejemplo |
+|----------|-------------|---------|
+| `DB_HOST` | Endpoint RDS | `mydb.cluster-xxx.us-east-1.rds.amazonaws.com` |
+| `DB_PORT` | Puerto | `5432` |
+| `DB_USER` | Usuario | `admin` |
+| `DB_PASS` | Password | `mi-password-seguro` |
+| `DB_NAME` | Base de datos | `mydb` |
+| `S3_BUCKET` | Bucket S3 destino | `mi-proyecto-dumps-short-term-123456789012` |
+
+Repetir para cada script que se vaya a usar (monthly y yearly).
+
+#### Paso 6: Habilitar servicio cron
 
 ```bash
 sudo systemctl enable crond
@@ -163,10 +263,10 @@ sudo systemctl start crond
 sudo systemctl status crond
 ```
 
-#### 5. Configurar crontabs
+#### Paso 7: Configurar crontabs
 
 ```bash
-# Crontab mensual - dia 5 de cada mes
+# Crontab mensual - dia 5 de cada mes a las 02:00
 sudo tee /etc/cron.d/dump-monthly > /dev/null <<'CRON'
 # Dump mensual - dia 5 de cada mes a las 02:00 -> bucket short-term (1 anio)
 0 2 5 * * root /opt/scripts/monthly/dump_oracle_monthly.sh >> /backups/oracle/logs/cron_monthly.log 2>&1
@@ -174,7 +274,7 @@ sudo tee /etc/cron.d/dump-monthly > /dev/null <<'CRON'
 0 3 5 * * root /opt/scripts/monthly/dump_mysql_monthly.sh >> /backups/mysql/logs/cron_monthly.log 2>&1
 CRON
 
-# Crontab anual - dia 10 de enero
+# Crontab anual - dia 10 de enero a las 02:00
 sudo tee /etc/cron.d/dump-yearly > /dev/null <<'CRON'
 # Dump anual - dia 10 de enero a las 02:00 -> bucket long-term (8 anios)
 0 2 10 1 * root /opt/scripts/yearly/dump_oracle_yearly.sh >> /backups/oracle/logs/cron_yearly.log 2>&1
@@ -185,42 +285,49 @@ CRON
 # Permisos correctos (cron requiere 644 y owner root)
 sudo chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
 sudo chown root:root /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
+
+# Reiniciar crond
+sudo systemctl restart crond
 ```
 
-#### 6. Configurar credenciales en los scripts
+> **Nota:** Comentar con `#` las líneas de los motores que no se usen en esa cuenta.
 
-Los scripts soportan dos modos de autenticación:
+#### Paso 8: Test del cron
 
-**Opción A — Secrets Manager (recomendado):**
+Para verificar que el cron ejecuta correctamente sin esperar al día programado:
 
-Crear el secret en AWS Secrets Manager con formato JSON:
 ```bash
-aws secretsmanager create-secret \
-  --name postgresql/rds/credentials \
-  --secret-string '{"host":"mydb.xxx.rds.amazonaws.com","port":"5432","username":"admin","password":"mi-password","dbname":"mydb"}'
+# Crear un cron de prueba que ejecute cada minuto
+sudo tee /etc/cron.d/dump-test > /dev/null <<'CRON'
+* * * * * root /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_test.log 2>&1
+CRON
+sudo chmod 644 /etc/cron.d/dump-test
+sudo chown root:root /etc/cron.d/dump-test
+
+# Esperar 2 minutos y verificar que se ejecuto
+sleep 120
+cat /backups/postgresql/logs/cron_test.log
+
+# Verificar en los logs del sistema
+sudo grep -i cron /var/log/messages | tail -10
+
+# IMPORTANTE: Eliminar el cron de prueba cuando termine el test
+sudo rm -f /etc/cron.d/dump-test
 ```
 
-Los scripts usan Secrets Manager por defecto. Solo editar `SECRET_NAME`, `AWS_REGION` y `S3_BUCKET` en cada script.
-
-**Opción B — Credenciales hardcodeadas:**
-
-Comentar el bloque "OPCION 1" y descomentar el bloque "OPCION 2" en la sección de configuración de cada script.
-
-#### 7. Verificar configuración
-
+Si el test falla, verificar:
 ```bash
-# Verificar crontabs cargados
-sudo cat /etc/cron.d/dump-monthly
-sudo cat /etc/cron.d/dump-yearly
+# Crond esta corriendo?
+sudo systemctl status crond
 
-# Verificar EFS montado
-mount | grep efs
+# Permisos del archivo cron?
+ls -la /etc/cron.d/dump-test
 
-# Test manual de un script (dry run)
-sudo /opt/scripts/monthly/dump_postgresql_monthly.sh
+# El script tiene permisos de ejecucion?
+ls -la /opt/scripts/monthly/dump_postgresql_monthly.sh
 
-# Ver logs
-tail -f /backups/postgresql/logs/dump_postgresql_monthly_*.log
+# Ver errores en logs del sistema
+sudo journalctl -u crond --since "5 minutes ago"
 ```
 
 ---
