@@ -45,8 +45,10 @@ echo "${efs_id}.efs.${aws_region}.amazonaws.com:/ /backups efs _netdev,tls 0 0" 
 mount -a || mount -t efs -o tls ${efs_id}:/ /backups
 
 echo "=== Creando directorios de trabajo ==="
-mkdir -p /backups/{oracle,postgresql,mysql}/{monthly,yearly,logs}
-mkdir -p /opt/scripts/{monthly,yearly}
+mkdir -p /backups/oracle/monthly /backups/oracle/yearly /backups/oracle/logs
+mkdir -p /backups/postgresql/monthly /backups/postgresql/yearly /backups/postgresql/logs
+mkdir -p /backups/mysql/monthly /backups/mysql/yearly /backups/mysql/logs
+mkdir -p /opt/scripts/monthly /opt/scripts/yearly
 
 echo "=== Habilitando servicio cron ==="
 systemctl enable crond

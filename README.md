@@ -114,10 +114,114 @@ terraform init && terraform plan && terraform apply
 
 ### Post-despliegue EC2
 
-1. Copiar los scripts a la instancia EC2 en `/opt/scripts/monthly/` y `/opt/scripts/yearly/`
-2. Editar la sección `CONFIGURACION` de cada script con los datos de conexión reales
-3. Dar permisos de ejecución: `chmod +x /opt/scripts/{monthly,yearly}/*.sh`
-4. Los crontabs ya están configurados por el user data
+Una vez desplegada la infraestructura, conectarse a la instancia via SSM o SSH y ejecutar los siguientes pasos manualmente si el user data no los completó correctamente:
+
+#### 1. Montar EFS en /backups
+
+```bash
+# Crear punto de montaje
+sudo mkdir -p /backups
+
+# Agregar entrada en fstab (reemplazar EFS_ID y REGION con valores reales)
+echo "fs-XXXXXXXX.efs.us-east-1.amazonaws.com:/ /backups efs _netdev,tls 0 0" | sudo tee -a /etc/fstab
+
+# Montar
+sudo mount -a
+# Si falla, intentar montaje directo:
+# sudo mount -t efs -o tls fs-XXXXXXXX:/ /backups
+
+# Verificar
+df -h /backups
+```
+
+#### 2. Crear directorios de trabajo
+
+```bash
+sudo mkdir -p /backups/oracle/monthly /backups/oracle/yearly /backups/oracle/logs
+sudo mkdir -p /backups/postgresql/monthly /backups/postgresql/yearly /backups/postgresql/logs
+sudo mkdir -p /backups/mysql/monthly /backups/mysql/yearly /backups/mysql/logs
+sudo mkdir -p /opt/scripts/monthly /opt/scripts/yearly
+```
+
+#### 3. Copiar scripts a la instancia
+
+```bash
+# Desde tu maquina local (via SCP o SSM)
+scp scripts/monthly/*.sh ec2-user@<IP>:/opt/scripts/monthly/
+scp scripts/yearly/*.sh ec2-user@<IP>:/opt/scripts/yearly/
+
+# Dar permisos de ejecucion
+sudo chmod +x /opt/scripts/monthly/*.sh
+sudo chmod +x /opt/scripts/yearly/*.sh
+```
+
+#### 4. Habilitar servicio cron
+
+```bash
+sudo systemctl enable crond
+sudo systemctl start crond
+sudo systemctl status crond
+```
+
+#### 5. Configurar crontabs
+
+```bash
+# Crontab mensual - dia 5 de cada mes
+sudo tee /etc/cron.d/dump-monthly > /dev/null <<'CRON'
+# Dump mensual - dia 5 de cada mes a las 02:00 -> bucket short-term (1 anio)
+0 2 5 * * root /opt/scripts/monthly/dump_oracle_monthly.sh >> /backups/oracle/logs/cron_monthly.log 2>&1
+30 2 5 * * root /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_monthly.log 2>&1
+0 3 5 * * root /opt/scripts/monthly/dump_mysql_monthly.sh >> /backups/mysql/logs/cron_monthly.log 2>&1
+CRON
+
+# Crontab anual - dia 10 de enero
+sudo tee /etc/cron.d/dump-yearly > /dev/null <<'CRON'
+# Dump anual - dia 10 de enero a las 02:00 -> bucket long-term (8 anios)
+0 2 10 1 * root /opt/scripts/yearly/dump_oracle_yearly.sh >> /backups/oracle/logs/cron_yearly.log 2>&1
+30 2 10 1 * root /opt/scripts/yearly/dump_postgresql_yearly.sh >> /backups/postgresql/logs/cron_yearly.log 2>&1
+0 3 10 1 * root /opt/scripts/yearly/dump_mysql_yearly.sh >> /backups/mysql/logs/cron_yearly.log 2>&1
+CRON
+
+# Permisos correctos (cron requiere 644 y owner root)
+sudo chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
+sudo chown root:root /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
+```
+
+#### 6. Configurar credenciales en los scripts
+
+Los scripts soportan dos modos de autenticación:
+
+**Opción A — Secrets Manager (recomendado):**
+
+Crear el secret en AWS Secrets Manager con formato JSON:
+```bash
+aws secretsmanager create-secret \
+  --name postgresql/rds/credentials \
+  --secret-string '{"host":"mydb.xxx.rds.amazonaws.com","port":"5432","username":"admin","password":"mi-password","dbname":"mydb"}'
+```
+
+Los scripts usan Secrets Manager por defecto. Solo editar `SECRET_NAME`, `AWS_REGION` y `S3_BUCKET` en cada script.
+
+**Opción B — Credenciales hardcodeadas:**
+
+Comentar el bloque "OPCION 1" y descomentar el bloque "OPCION 2" en la sección de configuración de cada script.
+
+#### 7. Verificar configuración
+
+```bash
+# Verificar crontabs cargados
+sudo cat /etc/cron.d/dump-monthly
+sudo cat /etc/cron.d/dump-yearly
+
+# Verificar EFS montado
+mount | grep efs
+
+# Test manual de un script (dry run)
+sudo /opt/scripts/monthly/dump_postgresql_monthly.sh
+
+# Ver logs
+tail -f /backups/postgresql/logs/dump_postgresql_monthly_*.log
+```
 
 ---
 
