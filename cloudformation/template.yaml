@@ -205,6 +205,19 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/dumps/*'
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowReadSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+                Condition:
+                  StringEquals:
+                    'secretsmanager:VersionStage': AWSCURRENT
 
   BastionInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -292,19 +305,21 @@ Resources:
           systemctl start crond
 
           echo "=== Configurando crontabs ==="
-          cat > /etc/cron.d/dump-monthly <<'CRON'
-          # Dump mensual - dia 5 de cada mes a las 02:00 -> bucket short-term (1 año)
+          cat > /etc/cron.d/dump-monthly <<CRON
+          # Dump mensual - dia 5 de cada mes a las 02:00 -> bucket short-term (1 anio)
           0 2 5 * * root /opt/scripts/monthly/dump_oracle_monthly.sh >> /backups/oracle/logs/cron_monthly.log 2>&1
           30 2 5 * * root /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_monthly.log 2>&1
           0 3 5 * * root /opt/scripts/monthly/dump_mysql_monthly.sh >> /backups/mysql/logs/cron_monthly.log 2>&1
           CRON
+          sed -i 's/^[[:space:]]*//' /etc/cron.d/dump-monthly
 
-          cat > /etc/cron.d/dump-yearly <<'CRON'
-          # Dump anual - dia 10 de enero a las 02:00 -> bucket long-term (8 años)
+          cat > /etc/cron.d/dump-yearly <<CRON
+          # Dump anual - dia 10 de enero a las 02:00 -> bucket long-term (8 anios)
           0 2 10 1 * root /opt/scripts/yearly/dump_oracle_yearly.sh >> /backups/oracle/logs/cron_yearly.log 2>&1
           30 2 10 1 * root /opt/scripts/yearly/dump_postgresql_yearly.sh >> /backups/postgresql/logs/cron_yearly.log 2>&1
           0 3 10 1 * root /opt/scripts/yearly/dump_mysql_yearly.sh >> /backups/mysql/logs/cron_yearly.log 2>&1
           CRON
+          sed -i 's/^[[:space:]]*//' /etc/cron.d/dump-yearly
 
           chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
 

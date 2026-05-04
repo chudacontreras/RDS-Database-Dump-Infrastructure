@@ -5,3 +5,9 @@ key_pair_name    = "my-key-pair"
 allowed_ssh_cidr = "10.0.0.0/8"
 instance_type    = "t3.medium"
 project_name     = "rds-dumps"
+
+# Nombres de los secrets en AWS Secrets Manager
+# Cada secret debe contener un JSON con: host, port, username, password, dbname
+oracle_secret_name     = "oracle/rds/credentials"
+postgresql_secret_name = "postgresql/rds/credentials"
+mysql_secret_name      = "mysql/rds/credentials"

@@ -12,14 +12,46 @@
 set -euo pipefail
 
 # ======================== CONFIGURACION ========================
-DB_HOST="CHANGE_ME.rds.amazonaws.com"
-DB_PORT="5432"
-DB_USER="admin"
-DB_PASS="CHANGE_ME"
-DB_NAME="mydb"
 SCHEMAS=""  # Dejar vacio para full, o "public,app"
-S3_BUCKET="CHANGE_ME-dumps-short-term"
+S3_BUCKET="${S3_BUCKET:-CHANGE_ME-dumps-short-term}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
 # ===============================================================
+
+# ---------- OPCION 1: Secrets Manager (por defecto) ------------
+# El secret debe contener un JSON con: host, port, username, password, dbname
+SECRET_NAME="${SECRET_NAME:-postgresql/rds/credentials}"
+
+get_secret() {
+  local secret_json
+  secret_json=$(aws secretsmanager get-secret-value \
+    --secret-id "${SECRET_NAME}" \
+    --region "${AWS_REGION}" \
+    --query 'SecretString' \
+    --output text 2>/dev/null) || {
+    echo "ERROR: No se pudo obtener el secret '${SECRET_NAME}' de Secrets Manager" >&2
+    exit 1
+  }
+  echo "${secret_json}"
+}
+
+SECRET_JSON=$(get_secret)
+DB_HOST=$(echo "${SECRET_JSON}" | jq -r '.host')
+DB_PORT=$(echo "${SECRET_JSON}" | jq -r '.port // "5432"')
+DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
+DB_PASS=$(echo "${SECRET_JSON}" | jq -r '.password')
+DB_NAME=$(echo "${SECRET_JSON}" | jq -r '.dbname')
+# ---------------------------------------------------------------
+
+# ---------- OPCION 2: Credenciales hardcodeadas ----------------
+# Descomentar este bloque y comentar la OPCION 1 para usar
+# credenciales directas sin Secrets Manager.
+#
+# DB_HOST="CHANGE_ME.rds.amazonaws.com"
+# DB_PORT="5432"
+# DB_USER="admin"
+# DB_PASS="CHANGE_ME"
+# DB_NAME="mydb"
+# ---------------------------------------------------------------
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_DIR="/backups/postgresql/monthly"
