@@ -215,9 +215,6 @@ Resources:
                   - secretsmanager:GetSecretValue
                   - secretsmanager:DescribeSecret
                 Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
-                Condition:
-                  StringEquals:
-                    'secretsmanager:VersionStage': AWSCURRENT
 
   BastionInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -318,6 +315,45 @@ Resources:
               chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
 
               echo "=== Configuracion completada ==="
+
+              # ==============================================================================
+              # NOTA: Politica de Secrets Manager
+              # ==============================================================================
+              # El IAM Role del bastion ya incluye permisos para leer secrets.
+              # Por defecto permite leer TODOS los secrets de la cuenta.
+              #
+              # ARN generico de un secret en Secrets Manager:
+              #   arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:<SECRET_NAME>-<RANDOM_6_CHARS>
+              #
+              # Ejemplo real:
+              #   arn:aws:secretsmanager:us-east-1:123456789012:secret:postgresAurora/qa/rds-credentials-AbCdEf
+              #
+              # Para restringir el acceso solo a secrets especificos, modificar la policy
+              # SecretsManagerReadPolicy del role del bastion con el siguiente comando:
+              #
+              #   aws iam put-role-policy \
+              #     --role-name <NOMBRE_DEL_ROLE> \
+              #     --policy-name SecretsManagerReadPolicy \
+              #     --policy-document '{
+              #       "Version": "2012-10-17",
+              #       "Statement": [{
+              #         "Sid": "AllowReadSecrets",
+              #         "Effect": "Allow",
+              #         "Action": [
+              #           "secretsmanager:GetSecretValue",
+              #           "secretsmanager:DescribeSecret"
+              #         ],
+              #         "Resource": [
+              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:postgresAurora/*",
+              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:oracle/*",
+              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:mysql/*"
+              #         ]
+              #       }]
+              #     }'
+              #
+              # IMPORTANTE: Secrets Manager agrega un sufijo aleatorio de 6 caracteres al ARN
+              # del secret, por eso se usa el wildcard (*) al final del prefijo.
+              # ==============================================================================
             - EfsId: !Ref EFSFileSystem
               Region: !Ref 'AWS::Region'
 
