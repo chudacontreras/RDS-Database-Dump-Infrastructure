@@ -31,6 +31,7 @@ Dos soluciones disponibles:
 │       ├── handler.py
 │       └── Dockerfile             # Container image (Oracle Instant Client)
 ├── scripts/                       # Scripts bash para la solución EC2
+│   ├── setup_oracle_s3_integration.sh  # Setup integración S3 ↔ Oracle RDS
 │   ├── monthly/
 │   │   ├── dump_oracle_monthly.sh
 │   │   ├── dump_postgresql_monthly.sh
@@ -405,3 +406,148 @@ terraform init && terraform plan && terraform apply
 ### Nota sobre NAT Gateway
 
 Las Lambdas en VPC necesitan un NAT Gateway para acceder a servicios AWS (S3, Secrets Manager, CloudWatch). Si tu VPC ya tiene NAT Gateway configurado, no necesitas cambios adicionales. Si no, considera usar VPC Endpoints para S3 y Secrets Manager como alternativa más económica.
+
+---
+
+## Prerequisito: Integración S3 para Oracle RDS (Data Pump)
+
+Los scripts de dump de Oracle (`dump_oracle_monthly.sh`, `dump_oracle_yearly.sh`) usan **DBMS_DATAPUMP** para generar el export directamente en la instancia RDS y luego transferirlo a S3 usando `rdsadmin.rdsadmin_s3_tasks.upload_to_s3`. Esto requiere configurar la integración S3 en la instancia RDS Oracle.
+
+> **Esta configuración NO requiere reinicio de la instancia RDS.** La opción `S3_INTEGRATION` es non-persistent y se aplica en caliente.
+
+### Configuración automática
+
+```bash
+# Editar las variables al inicio del script
+vi scripts/setup_oracle_s3_integration.sh
+
+# Ejecutar
+export AWS_ACCOUNT_ID="000999883737"
+export AWS_REGION="us-east-1"
+export RDS_INSTANCE_ID="mi-instancia-oracle"
+export OPTION_GROUP_NAME="mi-option-group-custom"
+export S3_BUCKET_SHORT_TERM="mi-proyecto-dumps-short-term-000999883737"
+export S3_BUCKET_LONG_TERM="mi-proyecto-dumps-long-term-000999883737"
+
+chmod +x scripts/setup_oracle_s3_integration.sh
+./scripts/setup_oracle_s3_integration.sh
+```
+
+### Configuración manual (paso a paso)
+
+#### 1. Crear política IAM con acceso a los buckets S3
+
+```bash
+aws iam create-policy \
+  --policy-name rds-oracle-s3-integration-policy \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": [
+          "s3:GetObject",
+          "s3:ListBucket",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ],
+        "Resource": [
+          "arn:aws:s3:::mi-bucket-dumps-short-term",
+          "arn:aws:s3:::mi-bucket-dumps-short-term/*",
+          "arn:aws:s3:::mi-bucket-dumps-long-term",
+          "arn:aws:s3:::mi-bucket-dumps-long-term/*"
+        ]
+      }
+    ]
+  }'
+```
+
+#### 2. Crear IAM Role con trust policy para RDS
+
+```bash
+aws iam create-role \
+  --role-name rds-oracle-s3-integration-role \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "Service": "rds.amazonaws.com"
+        },
+        "Action": "sts:AssumeRole",
+        "Condition": {
+          "StringEquals": {
+            "aws:SourceAccount": "000999883737"
+          }
+        }
+      }
+    ]
+  }'
+```
+
+#### 3. Asociar la política al role
+
+```bash
+aws iam attach-role-policy \
+  --role-name rds-oracle-s3-integration-role \
+  --policy-arn arn:aws:iam::000999883737:policy/rds-oracle-s3-integration-policy
+```
+
+#### 4. Agregar S3_INTEGRATION al Option Group
+
+```bash
+aws rds add-option-to-option-group \
+  --option-group-name MI-OPTION-GROUP-CUSTOM \
+  --options OptionName=S3_INTEGRATION,OptionVersion=1.0
+```
+
+#### 5. Asociar el role a la instancia RDS
+
+```bash
+aws rds add-role-to-db-instance \
+  --db-instance-identifier mi-instancia-oracle \
+  --feature-name S3_INTEGRATION \
+  --role-arn arn:aws:iam::000999883737:role/rds-oracle-s3-integration-role
+```
+
+#### 6. Verificar que el role está activo
+
+```bash
+aws rds describe-db-instances \
+  --db-instance-identifier mi-instancia-oracle \
+  --query 'DBInstances[0].AssociatedRoles'
+```
+
+Resultado esperado:
+```json
+[
+  {
+    "RoleArn": "arn:aws:iam::000999883737:role/rds-oracle-s3-integration-role",
+    "FeatureName": "S3_INTEGRATION",
+    "Status": "ACTIVE"
+  }
+]
+```
+
+#### 7. Verificar desde SQL*Plus
+
+```sql
+-- Listar archivos en DATA_PUMP_DIR
+SELECT * FROM TABLE(rdsadmin.rds_file_util.listdir('DATA_PUMP_DIR'));
+
+-- Test de upload a S3 (sube todos los archivos del directorio)
+SELECT rdsadmin.rdsadmin_s3_tasks.upload_to_s3(
+  p_bucket_name    => 'mi-bucket-dumps-short-term',
+  p_prefix         => 'test/',
+  p_directory_name => 'DATA_PUMP_DIR'
+) AS task_id FROM DUAL;
+
+-- Verificar el estado del task
+SELECT text FROM TABLE(rdsadmin.rds_file_util.read_text_file('BDUMP', 'dbtask-<task_id>.log'));
+```
+
+### Referencia
+
+- [Documentación oficial: Amazon S3 integration for Oracle RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html)
+- [Troubleshooting S3 integration](https://repost.aws/knowledge-center/rds-oracle-s3-integration)
