@@ -7,6 +7,15 @@
 # Uso manual:
 #   ./dump_oracle_monthly.sh
 #
+# Modos de export:
+#   - SCHEMAS="" (vacio)        → FULL export (requiere DATAPUMP_EXP_FULL_DATABASE)
+#   - SCHEMAS="SCHEMA1,SCHEMA2" → SCHEMA export (solo los schemas indicados)
+#
+# Prerequisitos:
+#   - Oracle Instant Client con sqlplus instalado
+#   - Integración S3 configurada en la instancia RDS Oracle
+#   - Para FULL export: GRANT DATAPUMP_EXP_FULL_DATABASE TO <usuario>;
+#
 # Configurar variables en la seccion CONFIGURACION antes de usar.
 ###############################################################################
 set -euo pipefail
@@ -49,7 +58,7 @@ DB_SERVICE=$(echo "${SECRET_JSON}" | jq -r '.dbname')
 # DB_HOST="CHANGE_ME.rds.amazonaws.com"
 # DB_PORT="1521"
 # DB_USER="admin"
-# DB_PASS="CHANGE_ME"
+# DB_PASS='CHANGE_ME'  # Usar comillas simples si tiene caracteres especiales
 # DB_SERVICE="ORCL"
 # ---------------------------------------------------------------
 
@@ -68,53 +77,115 @@ log() {
 
 cleanup() {
   log "Limpiando archivos temporales..."
-  if [[ -n "${DUMP_FILE:-}" && -f "${DUMP_FILE}" ]]; then
-    rm -f "${DUMP_FILE}"
-    log "Archivo temporal ${DUMP_FILE} eliminado"
-  fi
-  if [[ -n "${DUMP_FILE_RAW:-}" && -f "${DUMP_FILE_RAW}" ]]; then
-    rm -f "${DUMP_FILE_RAW}"
-  fi
+  # Limpiar archivos temporales de login si quedaron
+  rm -f /tmp/oracle_login_*.sql 2>/dev/null
 }
 trap cleanup EXIT
 
 DB_IDENTIFIER="${DB_SERVICE}"
-DUMP_FILE_RAW="${BACKUP_DIR}/${DB_IDENTIFIER}_monthly_${TIMESTAMP}.dmp"
-DUMP_FILE="${DUMP_FILE_RAW}.gz"
-S3_KEY="oracle/${DB_IDENTIFIER}/monthly/${DB_IDENTIFIER}_monthly_${TIMESTAMP}.dmp.gz"
-CONNECTION_STRING="${DB_USER}/${DB_PASS}@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${DB_HOST})(PORT=${DB_PORT}))(CONNECT_DATA=(SERVICE_NAME=${DB_SERVICE})))"
+DUMP_RDS_FILE="${DB_IDENTIFIER}_monthly_${TIMESTAMP}.dmp"
+DUMP_RDS_LOG="${DB_IDENTIFIER}_monthly_${TIMESTAMP}.log"
+S3_PREFIX="oracle/${DB_IDENTIFIER}/monthly/"
 
+# Construir TNS connect descriptor
+TNS_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${DB_HOST})(PORT=${DB_PORT}))(CONNECT_DATA=(SERVICE_NAME=${DB_SERVICE})))"
+
+# ==============================================================================
+# Funcion: run_sqlplus
+# Ejecuta SQL via sqlplus de forma segura (maneja passwords con caracteres especiales)
+# Usa archivo temporal con permisos 600 que se elimina inmediatamente despues
+# ==============================================================================
+run_sqlplus() {
+  local sql_input="$1"
+  local login_script
+  login_script=$(mktemp /tmp/oracle_login_XXXXXX.sql)
+  chmod 600 "${login_script}"
+
+  cat > "${login_script}" <<EOSQL
+CONNECT ${DB_USER}/"${DB_PASS}"@${TNS_CONNECT}
+${sql_input}
+EOSQL
+
+  sqlplus -S -L /nolog @"${login_script}"
+  local rc=$?
+  rm -f "${login_script}"
+  return ${rc}
+}
+
+# ==============================================================================
+# Funcion: check_sqlplus_output
+# Valida que el output de sqlplus no contenga errores ORA- o SP2-
+# ==============================================================================
+check_sqlplus_output() {
+  local output="$1"
+  local step_name="$2"
+
+  if echo "${output}" | grep -qiE "^(ORA-|SP2-|ERROR)"; then
+    log "ERROR en ${step_name}:"
+    echo "${output}" | grep -iE "^(ORA-|SP2-|ERROR)" | while read -r line; do
+      log "  ${line}"
+    done
+    return 1
+  fi
+  return 0
+}
+
+# ==============================================================================
+# INICIO DEL DUMP
+# ==============================================================================
 log "=========================================="
 log "Dump MENSUAL Oracle RDS → bucket short-term"
 log "Host: ${DB_HOST}:${DB_PORT} | Service: ${DB_SERVICE}"
+if [[ -n "${SCHEMAS}" ]]; then
+  log "Modo: SCHEMA (${SCHEMAS})"
+else
+  log "Modo: FULL (requiere DATAPUMP_EXP_FULL_DATABASE)"
+fi
 log "=========================================="
 
+# ---------- Verificar conectividad ----------
 log "Verificando conectividad..."
-echo "SELECT 'OK' FROM DUAL;" | sqlplus -S "${CONNECTION_STRING}" > /dev/null 2>&1 || {
-  log "ERROR: No se pudo conectar a Oracle RDS"; exit 1
-}
+CONNECT_OUTPUT=$(run_sqlplus "SELECT 'CONNECTION_OK' FROM DUAL;
+EXIT;" 2>&1) || true
 
-log "Ejecutando Data Pump export via RDS..."
+if ! echo "${CONNECT_OUTPUT}" | grep -q "CONNECTION_OK"; then
+  log "ERROR: No se pudo conectar a Oracle RDS"
+  log "Output: ${CONNECT_OUTPUT}"
+  exit 1
+fi
+log "Conectividad OK"
 
-# Generar el script PL/SQL para ejecutar DBMS_DATAPUMP en RDS
-DUMP_RDS_FILE="${DB_IDENTIFIER}_monthly_${TIMESTAMP}.dmp"
+# ---------- Determinar modo de export ----------
+if [[ -n "${SCHEMAS}" ]]; then
+  EXPORT_MODE="SCHEMA"
+  # Construir filtro de schemas para Data Pump
+  SCHEMA_FILTER=""
+  IFS=',' read -ra SCHEMA_ARR <<< "${SCHEMAS}"
+  for schema in "${SCHEMA_ARR[@]}"; do
+    schema=$(echo "${schema}" | xargs)  # trim spaces
+    SCHEMA_FILTER="${SCHEMA_FILTER}  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (''${schema}'')');"$'\n'
+  done
+else
+  EXPORT_MODE="FULL"
+  SCHEMA_FILTER=""
+fi
+
+# ---------- Ejecutar Data Pump Export ----------
+log "Ejecutando Data Pump export (modo: ${EXPORT_MODE})..."
+
 DATAPUMP_SQL=$(cat <<EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
 SET LINESIZE 200
 DECLARE
-  v_hdnl   NUMBER;
-  v_status VARCHAR2(200);
+  v_hdnl      NUMBER;
   v_job_state VARCHAR2(30);
-  v_sts    ku\$_Status;
 BEGIN
-  -- Crear job de Data Pump Export
   v_hdnl := DBMS_DATAPUMP.OPEN(
     operation => 'EXPORT',
-    job_mode  => '$(if [[ -n "${SCHEMAS}" ]]; then echo "SCHEMA"; else echo "FULL"; fi)',
-    job_name  => 'MONTHLY_EXPORT_${TIMESTAMP}'
+    job_mode  => '${EXPORT_MODE}',
+    job_name  => 'MONTHLY_EXP_${TIMESTAMP}'
   );
 
-  -- Archivo de dump en el directorio DATA_PUMP_DIR de RDS
   DBMS_DATAPUMP.ADD_FILE(
     handle    => v_hdnl,
     filename  => '${DUMP_RDS_FILE}',
@@ -122,33 +193,23 @@ BEGIN
     filetype  => DBMS_DATAPUMP.KU\$_FILE_TYPE_DUMP_FILE
   );
 
-  -- Log file
   DBMS_DATAPUMP.ADD_FILE(
     handle    => v_hdnl,
-    filename  => '${DB_IDENTIFIER}_monthly_${TIMESTAMP}.log',
+    filename  => '${DUMP_RDS_LOG}',
     directory => 'DATA_PUMP_DIR',
     filetype  => DBMS_DATAPUMP.KU\$_FILE_TYPE_LOG_FILE
   );
 
-$(if [[ -n "${SCHEMAS}" ]]; then
-  IFS=',' read -ra SCHEMA_ARR <<< "${SCHEMAS}"
-  for schema in "${SCHEMA_ARR[@]}"; do
-    echo "  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (''${schema}'')');"
-  done
-fi)
-
-  -- Compression
+${SCHEMA_FILTER}
   DBMS_DATAPUMP.SET_PARAMETER(v_hdnl, 'COMPRESSION', 'ALL');
 
-  -- Iniciar el job
   DBMS_DATAPUMP.START_JOB(v_hdnl);
-
-  -- Esperar a que termine
   DBMS_DATAPUMP.WAIT_FOR_JOB(v_hdnl, v_job_state);
-  DBMS_OUTPUT.PUT_LINE('Job finalizado con estado: ' || v_job_state);
+
+  DBMS_OUTPUT.PUT_LINE('DATAPUMP_STATUS=' || v_job_state);
 
   IF v_job_state != 'COMPLETED' THEN
-    RAISE_APPLICATION_ERROR(-20001, 'Data Pump export fallo con estado: ' || v_job_state);
+    RAISE_APPLICATION_ERROR(-20001, 'Data Pump export fallo: ' || v_job_state);
   END IF;
 END;
 /
@@ -156,94 +217,124 @@ EXIT;
 EOF
 )
 
-echo "${DATAPUMP_SQL}" | sqlplus -S "${CONNECTION_STRING}" 2>&1 | tee -a "${LOG_FILE}"
-SQLPLUS_RC=${PIPESTATUS[1]}
+DATAPUMP_OUTPUT=$(run_sqlplus "${DATAPUMP_SQL}" 2>&1) || true
+echo "${DATAPUMP_OUTPUT}" >> "${LOG_FILE}"
 
-if [[ ${SQLPLUS_RC} -ne 0 ]]; then
-  log "ERROR: Fallo el Data Pump export"
+# Validar output
+if ! check_sqlplus_output "${DATAPUMP_OUTPUT}" "Data Pump Export"; then
+  log "ERROR: Fallo el Data Pump export. Revise los privilegios del usuario."
+  log "Para FULL export ejecute: GRANT DATAPUMP_EXP_FULL_DATABASE TO ${DB_USER};"
+  log "Para SCHEMA export configure: SCHEMAS=\"SCHEMA1,SCHEMA2\""
   exit 1
 fi
 
-log "Export completado en RDS. Transfiriendo dump a S3..."
+if ! echo "${DATAPUMP_OUTPUT}" | grep -q "DATAPUMP_STATUS=COMPLETED"; then
+  log "ERROR: Data Pump no completo exitosamente"
+  log "Output: ${DATAPUMP_OUTPUT}"
+  exit 1
+fi
 
-# Transferir el dump desde RDS a S3 usando el procedimiento de RDS
+log "Data Pump export completado exitosamente"
+
+# ---------- Transferir dump a S3 via rdsadmin_s3_tasks ----------
+log "Transfiriendo dump a S3: s3://${S3_BUCKET}/${S3_PREFIX}..."
+
 TRANSFER_SQL=$(cat <<EOF
-SET SERVEROUTPUT ON
-BEGIN
-  rdsadmin.rdsadmin_util.upload_to_s3(
-    p_bucket_name    => '${S3_BUCKET}',
-    p_s3_prefix      => 'oracle/${DB_IDENTIFIER}/monthly/',
-    p_directory_name => 'DATA_PUMP_DIR',
-    p_file_name      => '${DUMP_RDS_FILE}'
-  );
-  DBMS_OUTPUT.PUT_LINE('Upload a S3 completado');
-END;
-/
-EXIT;
-EOF
-)
-
-echo "${TRANSFER_SQL}" | sqlplus -S "${CONNECTION_STRING}" 2>&1 | tee -a "${LOG_FILE}"
-SQLPLUS_RC=${PIPESTATUS[1]}
-
-if [[ ${SQLPLUS_RC} -ne 0 ]]; then
-  log "WARN: rdsadmin.upload_to_s3 no disponible. Descargando dump localmente..."
-
-  # Alternativa: descargar el dump via UTL_FILE y subir manualmente
-  # Descargar usando transferencia por bloques via SQL*Plus
-  DOWNLOAD_SQL=$(cat <<EOF
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
-SPOOL ${DUMP_FILE_RAW}
-SELECT * FROM TABLE(rdsadmin.rds_file_util.read_text_file('DATA_PUMP_DIR', '${DUMP_RDS_FILE}'));
-SPOOL OFF
-EXIT;
-EOF
-)
-
-  # Si la descarga directa no es viable, usar el metodo de S3 integration
-  log "Para usar este script, configure la integracion S3 en su instancia RDS Oracle."
-  log "Ref: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html"
-  log "Alternativa: use SELECT rdsadmin.rdsadmin_s3_tasks.upload_to_s3(...) FROM DUAL;"
-
-  # Intentar con rdsadmin_s3_tasks (disponible en versiones mas recientes)
-  TRANSFER_SQL2=$(cat <<EOF
-SET SERVEROUTPUT ON
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET LINESIZE 200
 DECLARE
   v_task_id VARCHAR2(100);
 BEGIN
   v_task_id := rdsadmin.rdsadmin_s3_tasks.upload_to_s3(
     p_bucket_name    => '${S3_BUCKET}',
-    p_prefix         => 'oracle/${DB_IDENTIFIER}/monthly/',
-    p_s3_prefix      => 'oracle/${DB_IDENTIFIER}/monthly/',
+    p_prefix         => '${S3_PREFIX}',
     p_directory_name => 'DATA_PUMP_DIR'
   );
-  DBMS_OUTPUT.PUT_LINE('Task ID: ' || v_task_id);
+  DBMS_OUTPUT.PUT_LINE('S3_TASK_ID=' || v_task_id);
 END;
 /
 EXIT;
 EOF
 )
 
-  echo "${TRANSFER_SQL2}" | sqlplus -S "${CONNECTION_STRING}" 2>&1 | tee -a "${LOG_FILE}"
-  SQLPLUS_RC=${PIPESTATUS[1]}
+TRANSFER_OUTPUT=$(run_sqlplus "${TRANSFER_SQL}" 2>&1) || true
+echo "${TRANSFER_OUTPUT}" >> "${LOG_FILE}"
 
-  if [[ ${SQLPLUS_RC} -ne 0 ]]; then
-    log "ERROR: No se pudo transferir el dump a S3. Configure la integracion S3 en RDS."
-    exit 1
-  fi
+if ! check_sqlplus_output "${TRANSFER_OUTPUT}" "Upload a S3"; then
+  log "ERROR: Fallo la transferencia a S3"
+  log "Verifique que la integracion S3 esta configurada:"
+  log "  1. Option Group con S3_INTEGRATION"
+  log "  2. IAM Role asociado a la instancia RDS"
+  log "  Ref: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html"
+  exit 1
 fi
 
-# Limpiar el dump del directorio DATA_PUMP_DIR en RDS
+# Extraer task ID
+S3_TASK_ID=$(echo "${TRANSFER_OUTPUT}" | grep "S3_TASK_ID=" | sed 's/S3_TASK_ID=//')
+log "Upload iniciado - Task ID: ${S3_TASK_ID}"
+
+# Esperar a que el task complete (polling cada 10 segundos, max 5 minutos)
+log "Esperando a que el upload complete..."
+MAX_WAIT=300
+ELAPSED=0
+UPLOAD_DONE=false
+
+while [[ ${ELAPSED} -lt ${MAX_WAIT} ]]; do
+  sleep 10
+  ELAPSED=$((ELAPSED + 10))
+
+  STATUS_SQL=$(cat <<EOF
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0
+SELECT text FROM TABLE(rdsadmin.rds_file_util.read_text_file('BDUMP', 'dbtask-${S3_TASK_ID}.log'));
+EXIT;
+EOF
+)
+
+  STATUS_OUTPUT=$(run_sqlplus "${STATUS_SQL}" 2>&1) || true
+
+  if echo "${STATUS_OUTPUT}" | grep -qi "finished successfully"; then
+    UPLOAD_DONE=true
+    break
+  elif echo "${STATUS_OUTPUT}" | grep -qi "error\|failed"; then
+    log "ERROR: Upload a S3 fallo"
+    log "${STATUS_OUTPUT}"
+    exit 1
+  fi
+done
+
+if [[ "${UPLOAD_DONE}" == "true" ]]; then
+  log "Upload a S3 completado exitosamente"
+else
+  log "WARN: Timeout esperando upload (${MAX_WAIT}s). Verificar manualmente con Task ID: ${S3_TASK_ID}"
+fi
+
+# ---------- Limpiar archivos en DATA_PUMP_DIR ----------
+log "Limpiando archivos temporales en RDS..."
+
 CLEANUP_SQL=$(cat <<EOF
+SET SERVEROUTPUT ON
 BEGIN
   UTL_FILE.FREMOVE('DATA_PUMP_DIR', '${DUMP_RDS_FILE}');
-  UTL_FILE.FREMOVE('DATA_PUMP_DIR', '${DB_IDENTIFIER}_monthly_${TIMESTAMP}.log');
+  UTL_FILE.FREMOVE('DATA_PUMP_DIR', '${DUMP_RDS_LOG}');
+  DBMS_OUTPUT.PUT_LINE('CLEANUP_OK');
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('CLEANUP_WARN: ' || SQLERRM);
 END;
 /
 EXIT;
 EOF
 )
-echo "${CLEANUP_SQL}" | sqlplus -S "${CONNECTION_STRING}" 2>&1 | tee -a "${LOG_FILE}"
 
-S3_KEY="oracle/${DB_IDENTIFIER}/monthly/${DUMP_RDS_FILE}"
-log "Dump mensual Oracle completado: s3://${S3_BUCKET}/${S3_KEY}"
+CLEANUP_OUTPUT=$(run_sqlplus "${CLEANUP_SQL}" 2>&1) || true
+echo "${CLEANUP_OUTPUT}" >> "${LOG_FILE}"
+
+if echo "${CLEANUP_OUTPUT}" | grep -q "CLEANUP_OK"; then
+  log "Archivos temporales eliminados de DATA_PUMP_DIR"
+else
+  log "WARN: No se pudieron eliminar todos los archivos temporales"
+fi
+
+log "=========================================="
+log "Dump mensual Oracle completado: s3://${S3_BUCKET}/${S3_PREFIX}${DUMP_RDS_FILE}"
+log "=========================================="

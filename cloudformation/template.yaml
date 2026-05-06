@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Infraestructura para dumps de RDS (Oracle, PostgreSQL, MySQL).
-  Incluye 2 buckets S3 con lifecycle, EC2 bastion, EFS y politicas de minimo privilegio.
+  Incluye 2 buckets S3 con lifecycle, EC2 bastion, EFS, SNS notifications y politicas de minimo privilegio.
 
 Parameters:
   VpcId:
@@ -22,13 +22,59 @@ Parameters:
     Default: t3.medium
     AllowedValues: [t3.micro, t3.small, t3.medium, t3.large, t3.xlarge]
     Description: Tipo de instancia EC2
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email para recibir notificaciones de dumps (dejar vacio para no suscribir)
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
 
 Resources:
   # ============================================================
-  # S3 Buckets
+  # SNS Topic para notificaciones de dumps (se crea primero)
+  # ============================================================
+  DumpNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-dump-notifications'
+      DisplayName: RDS Dump Notifications
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-dump-notifications'
+
+  DumpNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DumpNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref DumpNotificationTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref 'AWS::AccountId'
+
+  DumpNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref DumpNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ============================================================
+  # S3 Buckets con Event Notifications a SNS
   # ============================================================
   S3BucketLongTerm:
     Type: AWS::S3::Bucket
+    DependsOn: DumpNotificationTopicPolicy
     Properties:
       BucketName: !Sub '${AWS::StackName}-dumps-long-term-${AWS::AccountId}'
       BucketEncryption:
@@ -50,9 +96,39 @@ Resources:
               - StorageClass: GLACIER
                 TransitionInDays: 30
             ExpirationInDays: 2920
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: oracle/
+                  - Name: suffix
+                    Value: .dmp
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: postgresql/
+                  - Name: suffix
+                    Value: .gz
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: mysql/
+                  - Name: suffix
+                    Value: .gz
 
   S3BucketShortTerm:
     Type: AWS::S3::Bucket
+    DependsOn: DumpNotificationTopicPolicy
     Properties:
       BucketName: !Sub '${AWS::StackName}-dumps-short-term-${AWS::AccountId}'
       BucketEncryption:
@@ -74,6 +150,35 @@ Resources:
               - StorageClass: GLACIER
                 TransitionInDays: 30
             ExpirationInDays: 365
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: oracle/
+                  - Name: suffix
+                    Value: .dmp
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: postgresql/
+                  - Name: suffix
+                    Value: .gz
+          - Topic: !Ref DumpNotificationTopic
+            Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: mysql/
+                  - Name: suffix
+                    Value: .gz
 
   # ============================================================
   # EFS File System
@@ -315,51 +420,9 @@ Resources:
               chmod 644 /etc/cron.d/dump-monthly /etc/cron.d/dump-yearly
 
               echo "=== Configuracion completada ==="
-
-              # ==============================================================================
-              # NOTA: Politica de Secrets Manager
-              # ==============================================================================
-              # El IAM Role del bastion ya incluye permisos para leer secrets.
-              # Por defecto permite leer TODOS los secrets de la cuenta.
-              #
-              # ARN generico de un secret en Secrets Manager:
-              #   arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:<SECRET_NAME>-<RANDOM_6_CHARS>
-              #
-              # Ejemplo real:
-              #   arn:aws:secretsmanager:us-east-1:123456789012:secret:postgresAurora/qa/rds-credentials-AbCdEf
-              #
-              # Para restringir el acceso solo a secrets especificos, modificar la policy
-              # SecretsManagerReadPolicy del role del bastion con el siguiente comando:
-              #
-              #   aws iam put-role-policy \
-              #     --role-name <NOMBRE_DEL_ROLE> \
-              #     --policy-name SecretsManagerReadPolicy \
-              #     --policy-document '{
-              #       "Version": "2012-10-17",
-              #       "Statement": [{
-              #         "Sid": "AllowReadSecrets",
-              #         "Effect": "Allow",
-              #         "Action": [
-              #           "secretsmanager:GetSecretValue",
-              #           "secretsmanager:DescribeSecret"
-              #         ],
-              #         "Resource": [
-              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:postgresAurora/*",
-              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:oracle/*",
-              #           "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:mysql/*"
-              #         ]
-              #       }]
-              #     }'
-              #
-              # IMPORTANTE: Secrets Manager agrega un sufijo aleatorio de 6 caracteres al ARN
-              # del secret, por eso se usa el wildcard (*) al final del prefijo.
-              # ==============================================================================
             - EfsId: !Ref EFSFileSystem
               Region: !Ref 'AWS::Region'
 
-  # ============================================================
-  # Outputs
-  # ============================================================
 Outputs:
   BastionInstanceId:
     Description: ID de la instancia bastion
@@ -379,3 +442,9 @@ Outputs:
   BastionSecurityGroupId:
     Description: ID del security group del bastion
     Value: !Ref BastionSecurityGroup
+  DumpNotificationTopicArn:
+    Description: ARN del topico SNS para notificaciones de dumps
+    Value: !Ref DumpNotificationTopic
+  DumpNotificationTopicName:
+    Description: Nombre del topico SNS
+    Value: !GetAtt DumpNotificationTopic.TopicName
