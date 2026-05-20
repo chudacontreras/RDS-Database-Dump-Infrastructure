@@ -242,6 +242,40 @@ sudo vi /opt/scripts/monthly/dump_postgresql_monthly.sh
 | `SCHEMAS` | Schemas a exportar (vacío = todos) | `public,app` |
 | `SSL_MODE` | Modo SSL para la conexión (ver sección [Configuración SSL/TLS](#configuración-ssltls-para-conexiones-a-rds)) | PostgreSQL: `require` <br>MySQL: `REQUIRED` <br>Oracle: `disable` o `require` |
 
+> **⚠️ IMPORTANTE — Secrets gestionados por AWS RDS:**
+>
+> Los secrets que AWS RDS crea automáticamente (los que aparecen como `rds!db-XXXX` o cuando habilitas "Manage credentials in AWS Secrets Manager" al crear la RDS) **NO incluyen el campo `dbname`**. Solo contienen: `username`, `password`, `host`, `port`, `engine`, `dbInstanceIdentifier`.
+>
+> Si tu secret no tiene `dbname`, tienes 3 opciones:
+>
+> **a) Pasar el nombre como variable de entorno (más rápido):**
+> ```bash
+> # PostgreSQL / MySQL
+> DB_NAME=mydb /opt/scripts/monthly/dump_postgresql_monthly.sh
+>
+> # Oracle (usa DB_SERVICE)
+> DB_SERVICE=ORCL /opt/scripts/monthly/dump_oracle_monthly.sh
+>
+> # MySQL — todas las bases
+> DB_NAME=ALL /opt/scripts/monthly/dump_mysql_monthly.sh
+> ```
+>
+> **b) Editar el secret y agregar `dbname` al JSON:**
+> ```json
+> {
+>   "username": "admin",
+>   "password": "...",
+>   "host": "...",
+>   "port": 5432,
+>   "dbname": "mydb"
+> }
+> ```
+>
+> **c) En el crontab, exportar la variable antes del script:**
+> ```cron
+> 0 2 5 * * root DB_NAME=mydb /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_monthly.log 2>&1
+> ```
+
 **Variables a modificar (OPCION 2 — Credenciales hardcodeadas):**
 
 Comentar el bloque OPCION 1 y descomentar OPCION 2, luego editar:
@@ -252,7 +286,7 @@ Comentar el bloque OPCION 1 y descomentar OPCION 2, luego editar:
 | `DB_PORT` | Puerto | `5432` |
 | `DB_USER` | Usuario | `admin` |
 | `DB_PASS` | Password (usar comillas simples si tiene caracteres especiales) | `'mi-password-seguro'` |
-| `DB_NAME` | Base de datos | `mydb` |
+| `DB_NAME` (PostgreSQL/MySQL) <br> `DB_SERVICE` (Oracle) | Base de datos / Service Name | `mydb` / `ORCL` |
 | `S3_BUCKET` | Bucket S3 destino | `mi-proyecto-dumps-short-term-123456789012` |
 | `SSL_MODE` | Modo SSL (ver sección SSL más abajo) | `require` / `REQUIRED` / `disable` |
 
@@ -553,6 +587,104 @@ SELECT text FROM TABLE(rdsadmin.rds_file_util.read_text_file('BDUMP', 'dbtask-<t
 
 - [Documentación oficial: Amazon S3 integration for Oracle RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html)
 - [Troubleshooting S3 integration](https://repost.aws/knowledge-center/rds-oracle-s3-integration)
+
+---
+
+---
+
+## Backup completo de TODAS las bases de la instancia RDS
+
+Para garantizar que se respaldan **todas las bases de datos** de una instancia RDS (no solo una), use el modo `ALL` que está disponible en los 3 motores. Esto es especialmente útil cuando los secrets de AWS RDS no incluyen el campo `dbname`, o cuando la instancia tiene múltiples bases.
+
+### Comportamiento por motor
+
+| Motor | Variable | Modo `ALL` | Resultado |
+|-------|----------|-----------|-----------|
+| **PostgreSQL** | `DB_NAME=ALL` | Descubre todas las bases con `pg_database` y dumpea cada una con `pg_dump` | Un archivo `.sql.gz` **por cada base** en `s3://bucket/postgresql/<dbname>/...` |
+| **MySQL** | `DB_NAME=ALL` | Usa `mysqldump --all-databases` (nativo) | **Un solo archivo** `.sql.gz` con todas las bases en `s3://bucket/mysql/ALL/...` |
+| **Oracle** | `SCHEMAS=ALL` | Descubre todos los schemas no-system con `dba_users` y los exporta con Data Pump | Un archivo `.dmp` con todos los schemas en `s3://bucket/oracle/<service>/...` |
+
+### Bases/schemas excluidos automáticamente
+
+| Motor | Excluidos |
+|-------|-----------|
+| PostgreSQL | `template0`, `template1`, `rdsadmin`, plantillas (`datistemplate=true`), bases sin conexión (`datallowconn=false`) |
+| MySQL | El backup nativo `--all-databases` ya excluye `information_schema`, `performance_schema`, `mysql.sys` cuando se restaura |
+| Oracle | Schemas Oracle-maintained (`SYS`, `SYSTEM`, `RDSADMIN`, `OUTLN`, `DBSNMP`, etc.) — usa `oracle_maintained='N'` en `dba_users` |
+
+### Privilegios necesarios para modo ALL
+
+| Motor | Privilegios mínimos |
+|-------|---------------------|
+| PostgreSQL | `CONNECT` en cada base + permisos para `SELECT` en `pg_database` (admin/master user lo tiene por default) |
+| MySQL | `SELECT, LOCK TABLES, SHOW VIEW, EVENT, TRIGGER` sobre `*.*` (admin/master user lo tiene) |
+| Oracle | `SELECT_CATALOG_ROLE` (para `dba_users`) + `EXP_FULL_DATABASE` o `DATAPUMP_EXP_FULL_DATABASE` |
+
+Si el usuario admin no tiene `SELECT_CATALOG_ROLE`, ejecutar como SYS:
+
+```sql
+GRANT SELECT_CATALOG_ROLE TO admin;
+```
+
+### Ejemplos de uso
+
+```bash
+# Respaldar TODAS las bases - PostgreSQL
+DB_NAME=ALL ./dump_postgresql_monthly.sh
+
+# Respaldar TODAS las bases - MySQL
+DB_NAME=ALL ./dump_mysql_monthly.sh
+
+# Respaldar TODOS los schemas - Oracle
+SCHEMAS=ALL ./dump_oracle_monthly.sh
+```
+
+En el crontab, exportar antes del comando:
+
+```cron
+0 2 5 * * root DB_NAME=ALL /opt/scripts/monthly/dump_postgresql_monthly.sh >> /backups/postgresql/logs/cron_monthly.log 2>&1
+30 2 5 * * root DB_NAME=ALL /opt/scripts/monthly/dump_mysql_monthly.sh >> /backups/mysql/logs/cron_monthly.log 2>&1
+0 3 5 * * root SCHEMAS=ALL /opt/scripts/monthly/dump_oracle_monthly.sh >> /backups/oracle/logs/cron_monthly.log 2>&1
+```
+
+### Validación post-backup
+
+Después de ejecutar el dump en modo ALL, los scripts de PostgreSQL imprimen un resumen al final del log:
+
+```
+==========================================
+RESUMEN
+  Total bases procesadas: 5
+  Exitosas: 5
+  Fallidas: 0
+==========================================
+```
+
+Si alguna base falló, el script termina con código de salida `1` y lista las bases problemáticas.
+
+Para verificar manualmente desde S3:
+
+```bash
+# PostgreSQL: cada base tiene su propio prefix
+aws s3 ls s3://mi-bucket-dumps-short-term/postgresql/ --recursive | grep "$(date +%Y%m%d)"
+
+# MySQL: archivo único con todas las bases
+aws s3 ls s3://mi-bucket-dumps-short-term/mysql/ALL/
+
+# Oracle: archivo único con todos los schemas
+aws s3 ls s3://mi-bucket-dumps-short-term/oracle/
+```
+
+### Comparación con bases individuales
+
+| Aspecto | `DB_NAME=ALL` | `DB_NAME=mydb` |
+|---------|--------------|----------------|
+| Archivos S3 (PostgreSQL) | Uno por base | Solo uno |
+| Archivos S3 (MySQL) | Un solo archivo con todo | Un archivo con esa base |
+| Archivos S3 (Oracle) | Un dump con todos los schemas | Un dump con los schemas indicados |
+| Tiempo de ejecución | Mayor (proporcional al # de bases) | Menor |
+| Garantía de cobertura | ✅ Total | ⚠️ Solo lo configurado |
+| Recomendado para | Producción / compliance | Bases específicas críticas |
 
 ---
 

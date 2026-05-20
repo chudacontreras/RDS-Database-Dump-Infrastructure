@@ -8,30 +8,23 @@
 #   ./dump_mysql_yearly.sh
 #
 # ==============================================================================
+# MODO DE EXPORT
+# ==============================================================================
+# Variable DB_NAME determina que se respalda:
+#
+#   DB_NAME="mydb"  → Respalda UNA base de datos especifica.
+#
+#   DB_NAME="ALL"   → Respalda TODAS las bases con --all-databases.
+#                     Recomendado para garantizar backup completo de la RDS.
+#                     Genera UN solo archivo con TODAS las bases.
+#
+# Si el secret de AWS RDS no incluye 'dbname', el default es ALL.
+#
+# ==============================================================================
 # CONFIGURACION SSL
 # ==============================================================================
-# Variable SSL_MODE controla el comportamiento de SSL:
-#
-#   "DISABLED"   → SIN SSL. Usar solo si la RDS NO tiene SSL forzado.
-#                  Si la RDS exige SSL, este modo FALLARA.
-#
-#   "PREFERRED"  → Usar SSL si esta disponible, sino conectar sin SSL.
-#                  Default de MySQL 8.
-#
-#   "REQUIRED"   → SSL obligatorio sin validar certificado del servidor.
-#                  Recomendado para la mayoría de casos con RDS.
-#
-#   "VERIFY_CA"  → SSL + valida que el certificado este firmado por un CA confiable.
-#                  Requiere el bundle de CA de AWS RDS (se descarga automaticamente).
-#
-#   "VERIFY_IDENTITY" → SSL + valida CA + valida hostname.
-#                       Maxima seguridad. Recomendado para PRODUCCION.
-#
-# Para SABER si tu RDS requiere SSL:
-#   - Console RDS → tu instancia → Parameter Group → buscar "require_secure_transport"
-#     - require_secure_transport=1 → SSL OBLIGATORIO
-#     - require_secure_transport=0 → SSL OPCIONAL
-#   - O conectarse y ejecutar: SHOW VARIABLES LIKE 'require_secure_transport';
+# Variable SSL_MODE: DISABLED | PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY
+# Default: REQUIRED
 ###############################################################################
 set -euo pipefail
 
@@ -61,11 +54,15 @@ get_secret() {
 }
 
 SECRET_JSON=$(get_secret)
-DB_HOST=$(echo "${SECRET_JSON}" | jq -r '.host')
-DB_PORT=$(echo "${SECRET_JSON}" | jq -r '.port // "3306"')
-DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
-DB_PASS=$(echo "${SECRET_JSON}" | jq -r '.password')
-DB_NAME=$(echo "${SECRET_JSON}" | jq -r '.dbname // "ALL"')
+DB_HOST="${DB_HOST:-$(echo "${SECRET_JSON}" | jq -r '.host // empty')}"
+DB_PORT="${DB_PORT:-$(echo "${SECRET_JSON}" | jq -r '.port // "3306"')}"
+DB_USER="${DB_USER:-$(echo "${SECRET_JSON}" | jq -r '.username // empty')}"
+DB_PASS="${DB_PASS:-$(echo "${SECRET_JSON}" | jq -r '.password // empty')}"
+# Los secrets de AWS RDS NO incluyen 'dbname' por defecto.
+# Defina DB_NAME aqui, exportala como env var, o use "ALL" para todas las bases:
+#   DB_NAME=mydb ./dump_mysql_yearly.sh
+#   DB_NAME=ALL ./dump_mysql_yearly.sh
+DB_NAME="${DB_NAME:-$(echo "${SECRET_JSON}" | jq -r '.dbname // "ALL"')}"
 # ---------------------------------------------------------------
 
 # ---------- OPCION 2: Credenciales hardcodeadas ----------------
@@ -75,6 +72,19 @@ DB_NAME=$(echo "${SECRET_JSON}" | jq -r '.dbname // "ALL"')
 # DB_PASS='CHANGE_ME'
 # DB_NAME="mydb"
 # ---------------------------------------------------------------
+
+# Validar que las variables criticas tengan valor
+if [[ -z "${DB_HOST}" || -z "${DB_USER}" || -z "${DB_PASS}" || -z "${DB_NAME}" || "${DB_NAME}" == "null" ]]; then
+  echo "ERROR: Faltan credenciales requeridas. Verifique:" >&2
+  [[ -z "${DB_HOST}" ]] && echo "  - DB_HOST esta vacio" >&2
+  [[ -z "${DB_USER}" ]] && echo "  - DB_USER esta vacio" >&2
+  [[ -z "${DB_PASS}" ]] && echo "  - DB_PASS esta vacio" >&2
+  if [[ -z "${DB_NAME}" || "${DB_NAME}" == "null" ]]; then
+    echo "  - DB_NAME esta vacio. Defina DB_NAME como variable de entorno o use ALL para todas:" >&2
+    echo "    DB_NAME=mydb ./script.sh    o    DB_NAME=ALL ./script.sh" >&2
+  fi
+  exit 1
+fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_DIR="/backups/mysql/yearly"

@@ -8,7 +8,12 @@
 #   ./dump_oracle_monthly.sh
 #
 # Modos de export:
-#   - SCHEMAS="" (vacio)        → FULL export (requiere DATAPUMP_EXP_FULL_DATABASE)
+#   - SCHEMAS=""                → FULL export (requiere DATAPUMP_EXP_FULL_DATABASE)
+#                                 Exporta TODA la instancia (incluye system schemas).
+#   - SCHEMAS="ALL"             → Descubre y exporta TODOS los schemas de usuario
+#                                 (excluye Oracle-maintained: SYS, SYSTEM, RDSADMIN, etc.)
+#                                 Recomendado para garantizar backup completo sin requerir
+#                                 el privilegio FULL_DATABASE.
 #   - SCHEMAS="SCHEMA1,SCHEMA2" → SCHEMA export (solo los schemas indicados)
 #
 # Prerequisitos:
@@ -69,23 +74,34 @@ get_secret() {
 }
 
 SECRET_JSON=$(get_secret)
-DB_HOST=$(echo "${SECRET_JSON}" | jq -r '.host')
-DB_PORT=$(echo "${SECRET_JSON}" | jq -r '.port // "1521"')
-DB_USER=$(echo "${SECRET_JSON}" | jq -r '.username')
-DB_PASS=$(echo "${SECRET_JSON}" | jq -r '.password')
-DB_SERVICE=$(echo "${SECRET_JSON}" | jq -r '.dbname')
+DB_HOST="${DB_HOST:-$(echo "${SECRET_JSON}" | jq -r '.host // empty')}"
+DB_PORT="${DB_PORT:-$(echo "${SECRET_JSON}" | jq -r '.port // "1521"')}"
+DB_USER="${DB_USER:-$(echo "${SECRET_JSON}" | jq -r '.username // empty')}"
+DB_PASS="${DB_PASS:-$(echo "${SECRET_JSON}" | jq -r '.password // empty')}"
+# IMPORTANTE: Los secrets gestionados por AWS RDS NO incluyen 'dbname' por defecto.
+# Para Oracle el dbname corresponde al SERVICE_NAME (ej: ORCL, RDSQA).
+# Si tu secret no lo tiene, defina DB_SERVICE aqui o exportela como variable de entorno:
+#   DB_SERVICE=RDSQA ./dump_oracle_monthly.sh
+DB_SERVICE="${DB_SERVICE:-$(echo "${SECRET_JSON}" | jq -r '.dbname // empty')}"
 # ---------------------------------------------------------------
 
 # ---------- OPCION 2: Credenciales hardcodeadas ----------------
-# Descomentar este bloque y comentar la OPCION 1 para usar
-# credenciales directas sin Secrets Manager.
-#
 # DB_HOST="CHANGE_ME.rds.amazonaws.com"
 # DB_PORT="1521"
 # DB_USER="admin"
-# DB_PASS='CHANGE_ME'  # Usar comillas simples si tiene caracteres especiales
+# DB_PASS='CHANGE_ME'
 # DB_SERVICE="ORCL"
 # ---------------------------------------------------------------
+
+# Validar que las variables criticas tengan valor
+if [[ -z "${DB_HOST}" || -z "${DB_USER}" || -z "${DB_PASS}" || -z "${DB_SERVICE}" ]]; then
+  echo "ERROR: Faltan credenciales requeridas. Verifique:" >&2
+  [[ -z "${DB_HOST}" ]] && echo "  - DB_HOST esta vacio" >&2
+  [[ -z "${DB_USER}" ]] && echo "  - DB_USER esta vacio" >&2
+  [[ -z "${DB_PASS}" ]] && echo "  - DB_PASS esta vacio" >&2
+  [[ -z "${DB_SERVICE}" ]] && echo "  - DB_SERVICE esta vacio (los secrets de AWS RDS no incluyen 'dbname'). Defina DB_SERVICE como variable de entorno: DB_SERVICE=ORCL ./script.sh" >&2
+  exit 1
+fi
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 BACKUP_DIR="/backups/oracle/monthly"
@@ -179,11 +195,11 @@ log "=========================================="
 log "Dump MENSUAL Oracle RDS → bucket short-term"
 log "Host: ${DB_HOST}:${DB_PORT} | Service: ${DB_SERVICE}"
 log "Protocol: ${PROTOCOL} (SSL_MODE=${SSL_MODE})"
-if [[ -n "${SCHEMAS}" ]]; then
-  log "Modo: SCHEMA (${SCHEMAS})"
-else
-  log "Modo: FULL (requiere DATAPUMP_EXP_FULL_DATABASE)"
-fi
+case "${SCHEMAS}" in
+  "")    log "Modo: FULL (requiere DATAPUMP_EXP_FULL_DATABASE)" ;;
+  "ALL") log "Modo: ALL SCHEMAS (descubrira automaticamente)" ;;
+  *)     log "Modo: SCHEMA (${SCHEMAS})" ;;
+esac
 log "=========================================="
 
 # ---------- Verificar conectividad ----------
@@ -199,7 +215,49 @@ fi
 log "Conectividad OK"
 
 # ---------- Determinar modo de export ----------
-if [[ -n "${SCHEMAS}" ]]; then
+# SCHEMAS=""             → FULL export (todos los schemas excepto los de Oracle)
+# SCHEMAS="ALL"          → Descubrir y exportar TODOS los schemas no-system
+# SCHEMAS="USR1,USR2"    → Exportar solo los schemas indicados
+if [[ "${SCHEMAS}" == "ALL" ]]; then
+  log "Modo ALL: descubriendo todos los schemas de usuario..."
+
+  # Listar schemas excluyendo los mantenidos por Oracle
+  DISCOVER_SCHEMAS_SQL="SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+SELECT username FROM dba_users
+WHERE oracle_maintained = 'N'
+  AND username NOT IN ('RDSADMIN', 'RDS_SUPERUSER_ROLE')
+ORDER BY username;
+EXIT;"
+
+  DISCOVERED_OUTPUT=$(run_sqlplus "${DISCOVER_SCHEMAS_SQL}" 2>&1) || true
+
+  if ! check_sqlplus_output "${DISCOVERED_OUTPUT}" "Listar schemas"; then
+    log "ERROR: No se pudieron listar los schemas. El usuario puede no tener acceso a dba_users."
+    log "Solucion: GRANT SELECT_CATALOG_ROLE TO ${DB_USER};"
+    exit 1
+  fi
+
+  # Filtrar lineas vacias y extraer solo nombres de schema
+  DISCOVERED_SCHEMAS=$(echo "${DISCOVERED_OUTPUT}" | grep -v '^$' | grep -vE '^(Connect|Last|SQL|Disconnect|Version)' | awk '{print $1}' | grep -v '^$')
+
+  if [[ -z "${DISCOVERED_SCHEMAS}" ]]; then
+    log "ERROR: No se encontraron schemas de usuario para respaldar"
+    exit 1
+  fi
+
+  SCHEMA_LIST=$(echo "${DISCOVERED_SCHEMAS}" | paste -sd ',' -)
+  SCHEMA_COUNT=$(echo "${DISCOVERED_SCHEMAS}" | wc -l | xargs)
+  log "Schemas encontrados (${SCHEMA_COUNT}): ${SCHEMA_LIST}"
+
+  EXPORT_MODE="SCHEMA"
+  SCHEMA_FILTER=""
+  while IFS= read -r schema; do
+    schema=$(echo "${schema}" | xargs)
+    [[ -z "${schema}" ]] && continue
+    SCHEMA_FILTER="${SCHEMA_FILTER}  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (''${schema}'')');"$'\n'
+  done <<< "${DISCOVERED_SCHEMAS}"
+
+elif [[ -n "${SCHEMAS}" ]]; then
   EXPORT_MODE="SCHEMA"
   # Construir filtro de schemas para Data Pump
   SCHEMA_FILTER=""
