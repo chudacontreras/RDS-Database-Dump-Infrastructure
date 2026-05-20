@@ -17,6 +17,28 @@
 #   - Para FULL export: GRANT DATAPUMP_EXP_FULL_DATABASE TO <usuario>;
 #
 # Configurar variables en la seccion CONFIGURACION antes de usar.
+# ==============================================================================
+# CONFIGURACION SSL/TCPS
+# ==============================================================================
+# Variable SSL_MODE controla el protocolo de conexion a Oracle:
+#
+#   "disable"  → Conexion TCP normal sin SSL.
+#                Usar solo si la instancia RDS Oracle NO tiene SSL configurado.
+#                Equivale a (PROTOCOL=TCP) en el TNS descriptor.
+#
+#   "require"  → Conexion TCPS (TCP con SSL) sin validar certificado.
+#                Equivale a (PROTOCOL=TCPS) en el TNS descriptor.
+#                Recomendado para la mayoría de casos con RDS Oracle SSL.
+#
+# Para HABILITAR SSL en RDS Oracle:
+#   1. Crear/usar un Option Group con la opcion "SSL" agregada
+#   2. Asociar el Option Group a la instancia RDS
+#   3. Por defecto el puerto SSL es 2484, pero RDS Oracle puede usar 1521
+#   4. Verificar el puerto SSL en RDS Console → Configuration → SSL_PORT
+#
+# Para SABER si tu RDS Oracle requiere SSL:
+#   - Console RDS → tu instancia → Configuration → buscar "Option Group"
+#   - Si el option group tiene la opcion "SSL", esta habilitado
 ###############################################################################
 set -euo pipefail
 
@@ -24,6 +46,9 @@ set -euo pipefail
 SCHEMAS=""  # Dejar vacio para FULL, o "SCHEMA1,SCHEMA2"
 S3_BUCKET="${S3_BUCKET:-CHANGE_ME-dumps-short-term}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+
+# ----- SSL: Cambiar a "disable" si la RDS NO usa SSL -----
+SSL_MODE="${SSL_MODE:-disable}"
 # ===============================================================
 
 # ---------- OPCION 1: Secrets Manager (por defecto) ------------
@@ -87,8 +112,25 @@ DUMP_RDS_FILE="${DB_IDENTIFIER}_monthly_${TIMESTAMP}.dmp"
 DUMP_RDS_LOG="${DB_IDENTIFIER}_monthly_${TIMESTAMP}.log"
 S3_PREFIX="oracle/${DB_IDENTIFIER}/monthly/"
 
-# Construir TNS connect descriptor
-TNS_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${DB_HOST})(PORT=${DB_PORT}))(CONNECT_DATA=(SERVICE_NAME=${DB_SERVICE})))"
+# ============================================================
+# Configuracion SSL/TCPS
+# ============================================================
+case "${SSL_MODE}" in
+  disable)
+    PROTOCOL="TCP"
+    ;;
+  require)
+    PROTOCOL="TCPS"
+    ;;
+  *)
+    echo "ERROR: SSL_MODE invalido: ${SSL_MODE}" >&2
+    echo "Valores validos: disable | require" >&2
+    exit 1
+    ;;
+esac
+
+# Construir TNS connect descriptor con el protocolo correcto
+TNS_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=${PROTOCOL})(HOST=${DB_HOST})(PORT=${DB_PORT}))(CONNECT_DATA=(SERVICE_NAME=${DB_SERVICE})))"
 
 # ==============================================================================
 # Funcion: run_sqlplus
@@ -136,6 +178,7 @@ check_sqlplus_output() {
 log "=========================================="
 log "Dump MENSUAL Oracle RDS → bucket short-term"
 log "Host: ${DB_HOST}:${DB_PORT} | Service: ${DB_SERVICE}"
+log "Protocol: ${PROTOCOL} (SSL_MODE=${SSL_MODE})"
 if [[ -n "${SCHEMAS}" ]]; then
   log "Modo: SCHEMA (${SCHEMAS})"
 else

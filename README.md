@@ -240,6 +240,7 @@ sudo vi /opt/scripts/monthly/dump_postgresql_monthly.sh
 | `AWS_REGION` | Región donde está el secret | `us-east-1` |
 | `S3_BUCKET` | Nombre del bucket S3 destino | `mi-proyecto-dumps-short-term-123456789012` |
 | `SCHEMAS` | Schemas a exportar (vacío = todos) | `public,app` |
+| `SSL_MODE` | Modo SSL para la conexión (ver sección [Configuración SSL/TLS](#configuración-ssltls-para-conexiones-a-rds)) | PostgreSQL: `require` <br>MySQL: `REQUIRED` <br>Oracle: `disable` o `require` |
 
 **Variables a modificar (OPCION 2 — Credenciales hardcodeadas):**
 
@@ -250,9 +251,10 @@ Comentar el bloque OPCION 1 y descomentar OPCION 2, luego editar:
 | `DB_HOST` | Endpoint RDS | `mydb.cluster-xxx.us-east-1.rds.amazonaws.com` |
 | `DB_PORT` | Puerto | `5432` |
 | `DB_USER` | Usuario | `admin` |
-| `DB_PASS` | Password | `mi-password-seguro` |
+| `DB_PASS` | Password (usar comillas simples si tiene caracteres especiales) | `'mi-password-seguro'` |
 | `DB_NAME` | Base de datos | `mydb` |
 | `S3_BUCKET` | Bucket S3 destino | `mi-proyecto-dumps-short-term-123456789012` |
+| `SSL_MODE` | Modo SSL (ver sección SSL más abajo) | `require` / `REQUIRED` / `disable` |
 
 Repetir para cada script que se vaya a usar (monthly y yearly).
 
@@ -551,3 +553,139 @@ SELECT text FROM TABLE(rdsadmin.rds_file_util.read_text_file('BDUMP', 'dbtask-<t
 
 - [Documentación oficial: Amazon S3 integration for Oracle RDS](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html)
 - [Troubleshooting S3 integration](https://repost.aws/knowledge-center/rds-oracle-s3-integration)
+
+---
+
+## Configuración SSL/TLS para conexiones a RDS
+
+Todos los scripts de dump soportan conexiones con y sin SSL. La variable `SSL_MODE` controla el comportamiento.
+
+### Cómo saber si tu RDS requiere SSL
+
+| Motor | Cómo verificarlo |
+|-------|------------------|
+| PostgreSQL | Console RDS → Parameter Group → buscar `rds.force_ssl`. Si está en `1`, SSL es **obligatorio**. <br>O ejecutar: `SHOW rds.force_ssl;` |
+| MySQL | Console RDS → Parameter Group → buscar `require_secure_transport`. Si está en `1`, SSL es **obligatorio**. <br>O ejecutar: `SHOW VARIABLES LIKE 'require_secure_transport';` |
+| Oracle | Console RDS → Configuration → Option Group. Si tiene la opción `SSL` agregada, SSL está habilitado. |
+
+### Modos SSL disponibles por motor
+
+#### PostgreSQL (`SSL_MODE`)
+
+| Modo | Descripción | Cuándo usar |
+|------|-------------|-------------|
+| `disable` | Sin SSL | Solo si la RDS NO tiene `rds.force_ssl=1` |
+| `require` | SSL obligatorio sin validar certificado | **Default**, recomendado para la mayoría de casos |
+| `verify-ca` | SSL + valida que el CA sea válido | Más seguro, requiere CA bundle |
+| `verify-full` | SSL + valida CA + valida hostname | Máxima seguridad, recomendado para **producción** |
+
+#### MySQL (`SSL_MODE`)
+
+| Modo | Descripción | Cuándo usar |
+|------|-------------|-------------|
+| `DISABLED` | Sin SSL | Solo si la RDS no requiere SSL |
+| `PREFERRED` | Usa SSL si está disponible | Default de MySQL 8 |
+| `REQUIRED` | SSL obligatorio sin validar certificado | **Default**, recomendado para la mayoría |
+| `VERIFY_CA` | SSL + valida CA | Más seguro |
+| `VERIFY_IDENTITY` | SSL + valida CA + valida hostname | Máxima seguridad, recomendado para **producción** |
+
+#### Oracle (`SSL_MODE`)
+
+| Modo | Protocolo TNS | Cuándo usar |
+|------|---------------|-------------|
+| `disable` | `TCP` | Default. Si tu RDS Oracle NO tiene Option Group con SSL |
+| `require` | `TCPS` | Si tu RDS Oracle tiene Option Group con SSL agregado |
+
+### Ejemplos de uso
+
+#### Caso 1: RDS sin SSL (entornos de desarrollo)
+
+Editar el script y cambiar:
+
+```bash
+# PostgreSQL
+SSL_MODE="${SSL_MODE:-disable}"
+
+# MySQL
+SSL_MODE="${SSL_MODE:-DISABLED}"
+
+# Oracle
+SSL_MODE="${SSL_MODE:-disable}"
+```
+
+#### Caso 2: RDS con SSL forzado (la mayoría de casos)
+
+No cambiar nada. Los defaults ya son los correctos:
+
+```bash
+# PostgreSQL → require
+# MySQL      → REQUIRED
+# Oracle     → disable (cambiar a "require" si tu Oracle tiene SSL en Option Group)
+```
+
+#### Caso 3: Producción con validación estricta de certificado
+
+Editar el script:
+
+```bash
+# PostgreSQL
+SSL_MODE="verify-full"
+
+# MySQL
+SSL_MODE="VERIFY_IDENTITY"
+
+# Oracle
+SSL_MODE="require"   # Oracle solo soporta require/disable en estos scripts
+```
+
+Cuando uses `verify-ca`/`verify-full` (PostgreSQL) o `VERIFY_CA`/`VERIFY_IDENTITY` (MySQL), el script descargará automáticamente el bundle de certificados oficial de AWS desde:
+
+```
+https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+```
+
+y lo guardará en `/etc/ssl/certs/rds-global-bundle.pem`. Esto requiere que el bastion tenga `sudo` y acceso a internet.
+
+#### Caso 4: Override por variable de entorno (sin editar el script)
+
+```bash
+# Probar conexión sin SSL temporalmente
+SSL_MODE=disable ./dump_postgresql_monthly.sh
+
+# Forzar verificación estricta
+SSL_MODE=verify-full ./dump_postgresql_monthly.sh
+```
+
+### Verificación rápida de SSL
+
+#### PostgreSQL
+```bash
+PGPASSWORD='tu-pass' psql \
+  "host=tu-rds.amazonaws.com port=5432 dbname=mydb user=admin sslmode=require" \
+  -c "SELECT ssl_is_used();"
+# Retorna 't' si está usando SSL
+```
+
+#### MySQL
+```bash
+mysql -h tu-rds.amazonaws.com -u admin -p \
+  --ssl-mode=REQUIRED \
+  -e "SHOW STATUS LIKE 'Ssl_cipher';"
+# Si devuelve un cipher, está usando SSL
+```
+
+#### Oracle
+```bash
+sqlplus admin/'pass'@"(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=tu-rds.amazonaws.com)(PORT=2484))(CONNECT_DATA=(SERVICE_NAME=ORCL)))"
+# Si conecta con TCPS, está usando SSL
+```
+
+### Troubleshooting SSL
+
+| Error | Causa probable | Solución |
+|-------|----------------|----------|
+| `SSL connection is required` (PostgreSQL) | RDS tiene `rds.force_ssl=1` y SSL_MODE=disable | Cambiar SSL_MODE a `require` |
+| `Connections using insecure transport are prohibited` (MySQL) | RDS tiene `require_secure_transport=1` y SSL_MODE=DISABLED | Cambiar SSL_MODE a `REQUIRED` |
+| `ORA-12660: Encryption or crypto-checksumming required` | Oracle requiere SSL (TCPS) | Cambiar SSL_MODE a `require` |
+| `server certificate for "X" does not match host name "Y"` | Hostname del certificado no coincide | Usar `verify-ca` en vez de `verify-full`, o usar el endpoint exacto del cluster |
+| `SSL error: certificate verify failed` | El CA bundle local está desactualizado | Borrar `/etc/ssl/certs/rds-global-bundle.pem` y re-ejecutar el script |
