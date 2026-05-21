@@ -27,7 +27,7 @@
 set -euo pipefail
 
 # ======================== CONFIGURACION ========================
-SCHEMAS=""  # Solo aplica cuando DB_NAME es una base especifica
+SCHEMAS="${SCHEMAS:-}"  # Vacio=todo, "public,app"=especificos. Override con env var.
 S3_BUCKET="${S3_BUCKET:-CHANGE_ME-dumps-long-term}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 

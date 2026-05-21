@@ -45,7 +45,7 @@
 set -euo pipefail
 
 # ======================== CONFIGURACION ========================
-SCHEMAS=""  # Dejar vacio para FULL, o "SCHEMA1,SCHEMA2"
+SCHEMAS="${SCHEMAS:-}"  # Vacio=FULL, "ALL"=todos los schemas, "S1,S2"=especificos. Override con env var.
 S3_BUCKET="${S3_BUCKET:-CHANGE_ME-dumps-long-term}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 
@@ -216,6 +216,18 @@ log "Conectividad OK"
 # SCHEMAS=""             → FULL export (todos los schemas excepto los de Oracle)
 # SCHEMAS="ALL"          → Descubrir y exportar TODOS los schemas no-system
 # SCHEMAS="USR1,USR2"    → Exportar solo los schemas indicados
+
+# Validar valor de SCHEMAS para evitar errores comunes
+case "${SCHEMAS^^}" in
+  FULL)
+    log "ERROR: SCHEMAS='FULL' no es un valor valido."
+    log "  Para FULL export ejecute SIN la variable: ./dump_oracle_yearly.sh"
+    log "  Para todos los schemas de usuario:  SCHEMAS=ALL ./dump_oracle_yearly.sh"
+    log "  Para schemas especificos:           SCHEMAS=\"S1,S2\" ./dump_oracle_yearly.sh"
+    exit 1
+    ;;
+esac
+
 if [[ "${SCHEMAS}" == "ALL" ]]; then
   log "Modo ALL: descubriendo todos los schemas de usuario..."
 

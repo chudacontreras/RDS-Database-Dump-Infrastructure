@@ -22,3 +22,8 @@ Thumbs.db
 
 # Obsidian
 .obsidian/
+
+# Audit reports (pueden contener info sensible)
+scripts/audit-reports/
+audit-reports/
+audit_*.txt
