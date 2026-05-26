@@ -195,11 +195,13 @@ log "=========================================="
 log "Dump MENSUAL Oracle RDS → bucket short-term"
 log "Host: ${DB_HOST}:${DB_PORT} | Service: ${DB_SERVICE}"
 log "Protocol: ${PROTOCOL} (SSL_MODE=${SSL_MODE})"
-case "${SCHEMAS}" in
-  "")    log "Modo: FULL (requiere DATAPUMP_EXP_FULL_DATABASE)" ;;
-  "ALL") log "Modo: ALL SCHEMAS (descubrira automaticamente)" ;;
-  *)     log "Modo: SCHEMA (${SCHEMAS})" ;;
-esac
+if [[ -z "${SCHEMAS}" ]]; then
+  log "Modo: ALL SCHEMAS (auto-descubrimiento, SE2 compatible)"
+elif [[ "${SCHEMAS}" == "ALL" ]]; then
+  log "Modo: ALL SCHEMAS (auto-descubrimiento)"
+else
+  log "Modo: SCHEMA (${SCHEMAS})"
+fi
 log "=========================================="
 
 # ---------- Verificar conectividad ----------
@@ -230,10 +232,15 @@ case "${SCHEMAS^^}" in
     ;;
 esac
 
-if [[ "${SCHEMAS}" == "ALL" ]]; then
-  log "Modo ALL: descubriendo todos los schemas de usuario..."
+# ==============================================================================
+# Oracle Standard Edition 2 NO soporta DBMS_DATAPUMP en modo FULL.
+# Por eso, tanto SCHEMAS="" (FULL) como SCHEMAS="ALL" se resuelven igual:
+# descubrir todos los schemas de usuario y exportarlos en modo SCHEMA.
+# ==============================================================================
 
-  # Listar schemas excluyendo los mantenidos por Oracle
+if [[ -z "${SCHEMAS}" || "${SCHEMAS}" == "ALL" ]]; then
+  log "Descubriendo todos los schemas de usuario (SE2 no soporta modo FULL)..."
+
   DISCOVER_SCHEMAS_SQL="SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
 SELECT username FROM dba_users
 WHERE oracle_maintained = 'N'
@@ -244,7 +251,7 @@ EXIT;"
   DISCOVERED_OUTPUT=$(run_sqlplus "${DISCOVER_SCHEMAS_SQL}" 2>&1) || true
 
   if ! check_sqlplus_output "${DISCOVERED_OUTPUT}" "Listar schemas"; then
-    log "ERROR: No se pudieron listar los schemas. El usuario puede no tener acceso a dba_users."
+    log "ERROR: No se pudieron listar los schemas."
     log "Solucion: GRANT SELECT_CATALOG_ROLE TO ${DB_USER};"
     exit 1
   fi
@@ -257,34 +264,73 @@ EXIT;"
     exit 1
   fi
 
-  SCHEMA_LIST=$(echo "${DISCOVERED_SCHEMAS}" | paste -sd ',' -)
   SCHEMA_COUNT=$(echo "${DISCOVERED_SCHEMAS}" | wc -l | xargs)
-  log "Schemas encontrados (${SCHEMA_COUNT}): ${SCHEMA_LIST}"
+  log "Schemas encontrados: ${SCHEMA_COUNT}"
 
+  # Construir lista IN ('S1','S2','S3',...) para METADATA_FILTER
+  SCHEMA_IN_LIST=$(echo "${DISCOVERED_SCHEMAS}" | awk '{printf "'\''%s'\'',",$1}' | sed 's/,$//')
   EXPORT_MODE="SCHEMA"
-  SCHEMA_FILTER=""
-  while IFS= read -r schema; do
-    schema=$(echo "${schema}" | xargs)
-    [[ -z "${schema}" ]] && continue
-    SCHEMA_FILTER="${SCHEMA_FILTER}  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (''${schema}'')');"$'\n'
-  done <<< "${DISCOVERED_SCHEMAS}"
+  SCHEMA_FILTER="  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_LIST', '${SCHEMA_IN_LIST}');"
 
-elif [[ -n "${SCHEMAS}" ]]; then
-  EXPORT_MODE="SCHEMA"
-  # Construir filtro de schemas para Data Pump
-  SCHEMA_FILTER=""
-  IFS=',' read -ra SCHEMA_ARR <<< "${SCHEMAS}"
-  for schema in "${SCHEMA_ARR[@]}"; do
-    schema=$(echo "${schema}" | xargs)  # trim spaces
-    SCHEMA_FILTER="${SCHEMA_FILTER}  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (''${schema}'')');"$'\n'
-  done
 else
-  EXPORT_MODE="FULL"
-  SCHEMA_FILTER=""
+  # Schemas especificos proporcionados por el usuario
+  EXPORT_MODE="SCHEMA"
+  IFS=',' read -ra SCHEMA_ARR <<< "${SCHEMAS}"
+  SCHEMA_IN_LIST=""
+  for schema in "${SCHEMA_ARR[@]}"; do
+    schema=$(echo "${schema}" | xargs | tr '[:lower:]' '[:upper:]')
+    SCHEMA_IN_LIST="${SCHEMA_IN_LIST}'${schema}',"
+  done
+  SCHEMA_IN_LIST="${SCHEMA_IN_LIST%,}"  # quitar ultima coma
+  SCHEMA_FILTER="  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_LIST', '${SCHEMA_IN_LIST}');"
+  log "Schemas a exportar: ${SCHEMAS}"
 fi
 
 # ---------- Ejecutar Data Pump Export ----------
 log "Ejecutando Data Pump export (modo: ${EXPORT_MODE})..."
+
+# Generar nombre de job unico (max 30 chars en Oracle)
+JOB_NAME="EXP_$(echo "${TIMESTAMP}" | tail -c 16)"
+
+# Limpiar jobs huerfanos previos que pudieron quedar de ejecuciones fallidas
+CLEANUP_JOBS_SQL=$(cat <<EOF
+SET SERVEROUTPUT ON SIZE UNLIMITED
+SET LINESIZE 200
+DECLARE
+  v_state VARCHAR2(30);
+BEGIN
+  -- Intentar detener y eliminar jobs huerfanos del mismo usuario
+  FOR rec IN (
+    SELECT owner_name, job_name, state
+    FROM dba_datapump_jobs
+    WHERE owner_name = USER
+      AND state IN ('NOT RUNNING', 'DEFINING')
+      AND job_name LIKE 'EXP_%'
+  ) LOOP
+    BEGIN
+      DBMS_DATAPUMP.ATTACH(job_name => rec.job_name, job_owner => rec.owner_name);
+      DBMS_DATAPUMP.STOP_JOB(DBMS_DATAPUMP.ATTACH(job_name => rec.job_name, job_owner => rec.owner_name), immediate => 1);
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+    BEGIN
+      EXECUTE IMMEDIATE 'DROP TABLE ' || USER || '."' || rec.job_name || '" PURGE';
+    EXCEPTION
+      WHEN OTHERS THEN NULL;
+    END;
+    DBMS_OUTPUT.PUT_LINE('Limpiado job huerfano: ' || rec.job_name);
+  END LOOP;
+END;
+/
+EXIT;
+EOF
+)
+
+CLEANUP_OUTPUT=$(run_sqlplus "${CLEANUP_JOBS_SQL}" 2>&1) || true
+if echo "${CLEANUP_OUTPUT}" | grep -q "Limpiado job"; then
+  log "Se limpiaron jobs huerfanos de ejecuciones previas"
+  echo "${CLEANUP_OUTPUT}" | grep "Limpiado" >> "${LOG_FILE}"
+fi
 
 DATAPUMP_SQL=$(cat <<EOF
 SET SERVEROUTPUT ON SIZE UNLIMITED
@@ -296,7 +342,7 @@ BEGIN
   v_hdnl := DBMS_DATAPUMP.OPEN(
     operation => 'EXPORT',
     job_mode  => '${EXPORT_MODE}',
-    job_name  => 'MONTHLY_EXP_${TIMESTAMP}'
+    job_name  => '${JOB_NAME}'
   );
 
   DBMS_DATAPUMP.ADD_FILE(
@@ -314,7 +360,10 @@ BEGIN
   );
 
 ${SCHEMA_FILTER}
-  DBMS_DATAPUMP.SET_PARAMETER(v_hdnl, 'COMPRESSION', 'ALL');
+
+  -- NOTA: COMPRESSION=ALL requiere Enterprise Edition (Advanced Compression).
+  -- En Standard Edition 2 usar METADATA_ONLY o no comprimir.
+  DBMS_DATAPUMP.SET_PARAMETER(v_hdnl, 'COMPRESSION', 'METADATA_ONLY');
 
   DBMS_DATAPUMP.START_JOB(v_hdnl);
   DBMS_DATAPUMP.WAIT_FOR_JOB(v_hdnl, v_job_state);
@@ -324,6 +373,13 @@ ${SCHEMA_FILTER}
   IF v_job_state != 'COMPLETED' THEN
     RAISE_APPLICATION_ERROR(-20001, 'Data Pump export fallo: ' || v_job_state);
   END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    DBMS_OUTPUT.PUT_LINE('DATAPUMP_ERROR_CODE=' || SQLCODE);
+    DBMS_OUTPUT.PUT_LINE('DATAPUMP_ERROR_MSG=' || SQLERRM);
+    DBMS_OUTPUT.PUT_LINE('DATAPUMP_ERROR_STACK=' || DBMS_UTILITY.FORMAT_ERROR_STACK);
+    DBMS_OUTPUT.PUT_LINE('DATAPUMP_ERROR_BACKTRACE=' || DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
+    RAISE;
 END;
 /
 EXIT;
@@ -335,9 +391,33 @@ echo "${DATAPUMP_OUTPUT}" >> "${LOG_FILE}"
 
 # Validar output
 if ! check_sqlplus_output "${DATAPUMP_OUTPUT}" "Data Pump Export"; then
-  log "ERROR: Fallo el Data Pump export. Revise los privilegios del usuario."
-  log "Para FULL export ejecute: GRANT DATAPUMP_EXP_FULL_DATABASE TO ${DB_USER};"
-  log "Para SCHEMA export configure: SCHEMAS=\"SCHEMA1,SCHEMA2\""
+  log "ERROR: Fallo el Data Pump export."
+
+  # Mostrar diagnostico detallado si esta disponible
+  if echo "${DATAPUMP_OUTPUT}" | grep -q "DATAPUMP_ERROR_MSG"; then
+    log "Detalle del error:"
+    echo "${DATAPUMP_OUTPUT}" | grep "DATAPUMP_ERROR" | while read -r line; do
+      log "  ${line}"
+    done
+  fi
+
+  # Diagnostico especifico por codigo de error
+  if echo "${DATAPUMP_OUTPUT}" | grep -q "ORA-39006"; then
+    log "DIAGNOSTICO: ORA-39006 = Error interno de Data Pump."
+    log "  Posible causa: la version Standard Edition 2 no soporta FULL export."
+    log "  Solucion: usar SCHEMAS=ALL o SCHEMAS=\"SCHEMA1,SCHEMA2\""
+  elif echo "${DATAPUMP_OUTPUT}" | grep -q "ORA-39002"; then
+    log "DIAGNOSTICO: ORA-39002 = Operacion invalida."
+    log "  Posibles causas:"
+    log "    1. Falta DATAPUMP_EXP_FULL_DATABASE (verificar con conectar_oracle.sh)"
+    log "    2. Oracle Standard Edition 2 no soporta FULL export via DBMS_DATAPUMP"
+    log "    3. Job con el mismo nombre ya existe (se intento limpiar automaticamente)"
+    log "  Solucion: probar con SCHEMAS=ALL o verificar la edicion de Oracle:"
+    log "    SELECT banner FROM v\$version;"
+  fi
+
+  log "Para FULL export: GRANT DATAPUMP_EXP_FULL_DATABASE TO ${DB_USER};"
+  log "Para SCHEMA export: SCHEMAS=\"SCHEMA1,SCHEMA2\" ./dump_oracle_monthly.sh"
   exit 1
 fi
 
