@@ -235,42 +235,25 @@ esac
 # ==============================================================================
 # Oracle Standard Edition 2 NO soporta DBMS_DATAPUMP en modo FULL.
 # Por eso, tanto SCHEMAS="" (FULL) como SCHEMAS="ALL" se resuelven igual:
-# descubrir todos los schemas de usuario y exportarlos en modo SCHEMA.
+# usar modo SCHEMA sin filtro — exporta todos los schemas accesibles.
+# Con DATAPUMP_EXP_FULL_DATABASE, esto incluye todos los schemas de usuario.
 # ==============================================================================
 
 if [[ -z "${SCHEMAS}" || "${SCHEMAS}" == "ALL" ]]; then
-  log "Descubriendo todos los schemas de usuario (SE2 no soporta modo FULL)..."
+  log "Descubriendo schemas de usuario (SE2 no soporta modo FULL)..."
 
   DISCOVER_SCHEMAS_SQL="SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
-SELECT username FROM dba_users
-WHERE oracle_maintained = 'N'
-  AND username NOT IN ('RDSADMIN', 'RDS_SUPERUSER_ROLE')
-ORDER BY username;
+SELECT COUNT(*) FROM dba_users WHERE oracle_maintained = 'N' AND username NOT IN ('RDSADMIN', 'RDS_SUPERUSER_ROLE');
 EXIT;"
 
   DISCOVERED_OUTPUT=$(run_sqlplus "${DISCOVER_SCHEMAS_SQL}" 2>&1) || true
+  SCHEMA_COUNT=$(echo "${DISCOVERED_OUTPUT}" | grep -oE '[0-9]+' | head -1)
+  log "Schemas de usuario encontrados: ${SCHEMA_COUNT:-desconocido}"
 
-  if ! check_sqlplus_output "${DISCOVERED_OUTPUT}" "Listar schemas"; then
-    log "ERROR: No se pudieron listar los schemas."
-    log "Solucion: GRANT SELECT_CATALOG_ROLE TO ${DB_USER};"
-    exit 1
-  fi
-
-  # Filtrar lineas vacias y extraer solo nombres de schema
-  DISCOVERED_SCHEMAS=$(echo "${DISCOVERED_OUTPUT}" | grep -v '^$' | grep -vE '^(Connect|Last|SQL|Disconnect|Version)' | awk '{print $1}' | grep -v '^$')
-
-  if [[ -z "${DISCOVERED_SCHEMAS}" ]]; then
-    log "ERROR: No se encontraron schemas de usuario para respaldar"
-    exit 1
-  fi
-
-  SCHEMA_COUNT=$(echo "${DISCOVERED_SCHEMAS}" | wc -l | xargs)
-  log "Schemas encontrados: ${SCHEMA_COUNT}"
-
-  # Construir lista IN ('S1','S2','S3',...) para METADATA_FILTER
-  SCHEMA_IN_LIST=$(echo "${DISCOVERED_SCHEMAS}" | awk '{printf "'\''%s'\'',",$1}' | sed 's/,$//')
+  # Modo SCHEMA sin METADATA_FILTER = exporta todos los schemas accesibles
+  # Con DATAPUMP_EXP_FULL_DATABASE esto incluye todos los schemas no-system
   EXPORT_MODE="SCHEMA"
-  SCHEMA_FILTER="  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_LIST', '${SCHEMA_IN_LIST}');"
+  SCHEMA_FILTER=""
 
 else
   # Schemas especificos proporcionados por el usuario
@@ -279,10 +262,10 @@ else
   SCHEMA_IN_LIST=""
   for schema in "${SCHEMA_ARR[@]}"; do
     schema=$(echo "${schema}" | xargs | tr '[:lower:]' '[:upper:]')
-    SCHEMA_IN_LIST="${SCHEMA_IN_LIST}'${schema}',"
+    SCHEMA_IN_LIST="${SCHEMA_IN_LIST}''${schema}'',"
   done
   SCHEMA_IN_LIST="${SCHEMA_IN_LIST%,}"  # quitar ultima coma
-  SCHEMA_FILTER="  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_LIST', '${SCHEMA_IN_LIST}');"
+  SCHEMA_FILTER="  DBMS_DATAPUMP.METADATA_FILTER(v_hdnl, 'SCHEMA_EXPR', 'IN (${SCHEMA_IN_LIST})');"
   log "Schemas a exportar: ${SCHEMAS}"
 fi
 
