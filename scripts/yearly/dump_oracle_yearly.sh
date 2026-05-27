@@ -415,20 +415,19 @@ log "Data Pump export completado exitosamente"
 # ---------- Transferir dump a S3 via rdsadmin_s3_tasks ----------
 log "Transfiriendo dump a S3: s3://${S3_BUCKET}/${S3_PREFIX}..."
 
+# Firma de upload_to_s3 en Oracle RDS 19c:
+#   p_bucket_name    - nombre del bucket S3
+#   p_directory_name - directorio Oracle (DATA_PUMP_DIR)
+#   p_s3_prefix      - prefijo/carpeta destino en S3
+#   p_prefix         - filtro de archivos en el directorio (para no subir todo)
 TRANSFER_SQL=$(cat <<EOF
-SET SERVEROUTPUT ON SIZE UNLIMITED
-SET LINESIZE 200
-DECLARE
-  v_task_id VARCHAR2(100);
-BEGIN
-  v_task_id := rdsadmin.rdsadmin_s3_tasks.upload_to_s3(
-    p_bucket_name    => '${S3_BUCKET}',
-    p_prefix         => '${S3_PREFIX}',
-    p_directory_name => 'DATA_PUMP_DIR'
-  );
-  DBMS_OUTPUT.PUT_LINE('S3_TASK_ID=' || v_task_id);
-END;
-/
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200
+SELECT rdsadmin.rdsadmin_s3_tasks.upload_to_s3(
+  p_bucket_name    => '${S3_BUCKET}',
+  p_directory_name => 'DATA_PUMP_DIR',
+  p_s3_prefix      => '${S3_PREFIX}',
+  p_prefix         => '${DUMP_RDS_FILE}'
+) AS task_id FROM DUAL;
 EXIT;
 EOF
 )
@@ -436,17 +435,18 @@ EOF
 TRANSFER_OUTPUT=$(run_sqlplus "${TRANSFER_SQL}" 2>&1) || true
 echo "${TRANSFER_OUTPUT}" >> "${LOG_FILE}"
 
-if ! check_sqlplus_output "${TRANSFER_OUTPUT}" "Upload a S3"; then
+if echo "${TRANSFER_OUTPUT}" | grep -qiE "^(ORA-|SP2-|ERROR)"; then
   log "ERROR: Fallo la transferencia a S3"
+  log "Detalle: $(echo "${TRANSFER_OUTPUT}" | grep -iE 'ORA-|ERROR' | head -3)"
   log "Verifique que la integracion S3 esta configurada:"
   log "  1. Option Group con S3_INTEGRATION"
-  log "  2. IAM Role asociado a la instancia RDS"
+  log "  2. IAM Role asociado a la instancia RDS con permisos S3"
   log "  Ref: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/oracle-s3-integration.html"
   exit 1
 fi
 
-# Extraer task ID
-S3_TASK_ID=$(echo "${TRANSFER_OUTPUT}" | grep "S3_TASK_ID=" | sed 's/S3_TASK_ID=//')
+# Extraer task ID (es la unica linea no vacia en el output)
+S3_TASK_ID=$(echo "${TRANSFER_OUTPUT}" | grep -v '^$' | grep -vE '^(ORA-|SP2-|ERROR|SQL)' | head -1 | xargs)
 log "Upload iniciado - Task ID: ${S3_TASK_ID}"
 
 # Esperar a que el task complete (polling cada 10 segundos, max 5 minutos)
