@@ -449,32 +449,21 @@ fi
 S3_TASK_ID=$(echo "${TRANSFER_OUTPUT}" | grep -v '^$' | grep -vE '^(ORA-|SP2-|ERROR|SQL)' | head -1 | xargs)
 log "Upload iniciado - Task ID: ${S3_TASK_ID}"
 
-# Esperar a que el task complete (polling cada 10 segundos, max 5 minutos)
+# Esperar a que el task complete verificando si el archivo aparece en S3
 log "Esperando a que el upload complete..."
 MAX_WAIT=300
 ELAPSED=0
 UPLOAD_DONE=false
 
 while [[ ${ELAPSED} -lt ${MAX_WAIT} ]]; do
-  sleep 10
-  ELAPSED=$((ELAPSED + 10))
+  sleep 15
+  ELAPSED=$((ELAPSED + 15))
 
-  STATUS_SQL=$(cat <<EOF
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0
-SELECT text FROM TABLE(rdsadmin.rds_file_util.read_text_file('BDUMP', 'dbtask-${S3_TASK_ID}.log'));
-EXIT;
-EOF
-)
-
-  STATUS_OUTPUT=$(run_sqlplus "${STATUS_SQL}" 2>&1) || true
-
-  if echo "${STATUS_OUTPUT}" | grep -qi "finished successfully"; then
+  # Verificar si el archivo ya aparece en S3
+  S3_CHECK=$(aws s3 ls "s3://${S3_BUCKET}/${S3_PREFIX}${DUMP_RDS_FILE}" 2>/dev/null || true)
+  if [[ -n "${S3_CHECK}" ]]; then
     UPLOAD_DONE=true
     break
-  elif echo "${STATUS_OUTPUT}" | grep -qi "error\|failed"; then
-    log "ERROR: Upload a S3 fallo"
-    log "${STATUS_OUTPUT}"
-    exit 1
   fi
 done
 
